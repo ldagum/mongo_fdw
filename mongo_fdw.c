@@ -380,6 +380,38 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	scanState->fdw_state = (void *) executionState;
 }
 
+static bson_type 
+BsonFindSubobject(bson_iterator *bsonIterator, bson *bsonObject, const char* path)
+{
+	ereport(INFO, (errmsg_internal("Finding %s", path)));
+	bson_type bsonCursorStatus = NULL;
+	char *dot = strchr(path, '.');
+	if (dot)
+	{
+		*dot = '\0';
+	}
+	bson_iterator_init(bsonIterator, bsonObject);
+	bsonCursorStatus = bson_find(bsonIterator, bsonObject, path);
+
+	if (!dot)
+	{
+		ereport(INFO, (errmsg_internal("Last dot!")));
+		return bsonCursorStatus;
+	}
+
+	*dot = '.';
+
+	if (bsonCursorStatus != BSON_OBJECT) {
+		ereport(INFO, (errmsg_internal("More dots but current path is not an object.")));
+		return BSON_EOO;
+	}
+
+	bson *sub = bson_create();
+	bson_iterator_subobject(bsonIterator, sub);
+	bsonCursorStatus = BsonFindSubobject(bsonIterator, sub, (dot + 1));
+	bson_dispose(sub);
+	return bsonCursorStatus;
+}
 
 /*
  * MongoIterateForeignScan reads the next document from MongoDB, converts it to
@@ -394,7 +426,6 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	mongo_cursor *mongoCursor = executionState->mongoCursor;
 	HTAB *columnMappingHash = executionState->columnMappingHash;
 	bson_iterator *arrayCursor = executionState->arrayCursor;
-	char *arrayFieldName = executionState->arrayFieldName;
 	int32 mongoCursorStatus = MONGO_ERROR;
 	bson_type bsonCursorStatus = NULL;
 	bson *collectionDocument = executionState->parentDocument;
@@ -451,6 +482,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 
 		/* Now we have a document from the collection */
 
+		char *arrayFieldName = executionState->arrayFieldName;
 		if(!arrayFieldName)
 		{
 			ereport(INFO, (errmsg_internal("Filling tuple from collection document.")));
@@ -463,14 +495,13 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 		}
 		else
 		{
-			ereport(INFO, (errmsg_internal("Getting embedded array")));
+			ereport(INFO, (errmsg_internal("Getting embedded array '%s'", arrayFieldName)));
 			/* We're iterating over an embedded array. */
 			if(!arrayCursor)
 			{
 				ereport(INFO, (errmsg_internal("Getting array cursor from collection document")));
 				bson_iterator bsonIterator = { NULL, 0 };
-				bson_iterator_init(&bsonIterator, collectionDocument);
-				bsonCursorStatus = bson_find(&bsonIterator, collectionDocument, arrayFieldName);
+				bsonCursorStatus = BsonFindSubobject(&bsonIterator, collectionDocument, arrayFieldName);
 
 				if (bsonCursorStatus == BSON_ARRAY) {
 					arrayCursor = bson_iterator_create();
