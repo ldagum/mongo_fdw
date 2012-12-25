@@ -50,10 +50,12 @@ static void ForeignTableEstimateCosts(PlannerInfo *root, RelOptInfo *baserel,
 static MongoFdwOptions * MongoGetOptions(Oid foreignTableId);
 static char * MongoGetOptionValue(List *optionList, const char *optionName);
 static HTAB * ColumnMappingHash(Oid foreignTableId, List *columnList);
-static void FillTupleSlot(const bson *bsonDocument, HTAB *columnMappingHash,
-						  Datum *columnValues, bool *columnNulls);
-static void FillTupleSlotHelper(const bson *bsonDocument, HTAB *columnMappingHash,
-						  Datum *columnValues, bool *columnNulls, const char *prefix);
+static void FillTupleSlot(const bson *currentDocument, const bson *parentDocument,
+						  HTAB *columnMappingHash, Datum *columnValues,
+						  bool *columnNulls);
+static void FillTupleSlotHelper(const bson *currentDocument, const bson *parentDocument,
+							    HTAB *columnMappingHash, Datum *columnValues,
+							    bool *columnNulls, const char *prefix);
 static bool ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId);
 static Datum ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId);
 static Datum ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId,
@@ -370,6 +372,9 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	executionState->columnMappingHash = columnMappingHash;
 	executionState->mongoConnection = mongoConnection;
 	executionState->mongoCursor = mongoCursor;
+	executionState->parentDocument = NULL;
+	executionState->arrayCursor = NULL;
+	executionState->arrayFieldName = mongoFdwOptions->fieldName;
 	executionState->queryDocument = queryDocument;
 
 	scanState->fdw_state = (void *) executionState;
@@ -388,7 +393,11 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
 	mongo_cursor *mongoCursor = executionState->mongoCursor;
 	HTAB *columnMappingHash = executionState->columnMappingHash;
-	int32 cursorStatus = MONGO_ERROR;
+	bson_iterator *arrayCursor = executionState->arrayCursor;
+	char *arrayFieldName = executionState->arrayFieldName;
+	int32 mongoCursorStatus = MONGO_ERROR;
+	bson_type bsonCursorStatus = NULL;
+	bson *collectionDocument = executionState->parentDocument;
 
 	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	Datum *columnValues = tupleSlot->tts_values;
@@ -407,37 +416,112 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	memset(columnValues, 0, columnCount * sizeof(Datum));
 	memset(columnNulls, true, columnCount * sizeof(bool));
 
-	cursorStatus = mongo_cursor_next(mongoCursor);
-	if (cursorStatus == MONGO_OK)
+	while(true)
 	{
-		const bson *bsonDocument = mongo_cursor_bson(mongoCursor);
-
-		FillTupleSlot(bsonDocument, columnMappingHash, columnValues, columnNulls);
-
-		ExecStoreVirtualTuple(tupleSlot);
-	}
-	else
-	{
-		/*
-		 * The following is a courtesy check. In practice when Mongo shuts down,
-		 * mongo_cursor_next() could possibly crash. This function first frees
-		 * cursor->reply, and then references reply in mongo_cursor_destroy().
-		 */
-		mongo_cursor_error_t errorCode = mongoCursor->err;
-		if (errorCode != MONGO_CURSOR_EXHAUSTED)
+		if(!collectionDocument)
 		{
-			MongoFreeScanState(executionState);
+			ereport(INFO, (errmsg_internal("Getting collection document")));
+			mongoCursorStatus = mongo_cursor_next(mongoCursor);
+			if(mongoCursorStatus == MONGO_OK)
+			{
+				collectionDocument = mongo_cursor_bson(mongoCursor);
+			}
+			else {
+				/*
+				 * The following is a courtesy check. In practice when Mongo shuts down,
+				 * mongo_cursor_next() could possibly crash. This function first frees
+				 * cursor->reply, and then references reply in mongo_cursor_destroy().
+				 */
+				mongo_cursor_error_t errorCode = mongoCursor->err;
+				if (errorCode != MONGO_CURSOR_EXHAUSTED)
+				{
+					MongoFreeScanState(executionState);
 
-			ereport(ERROR, (errmsg("could not iterate over mongo collection"),
-							errhint("Mongo driver cursor error code: %d", errorCode)));
+					ereport(ERROR, (errmsg("could not iterate over mongo collection"),
+									errhint("Mongo driver cursor error code: %d", errorCode)));
+				}
+				else
+				{
+					ereport(INFO, (errmsg_internal("Mongo cursor exhausted")));
+				}
+				/* EXIT */
+				return tupleSlot;
+			}
+		}
+
+		/* Now we have a document from the collection */
+
+		if(!arrayFieldName)
+		{
+			ereport(INFO, (errmsg_internal("Filling tuple from collection document.")));
+			/* We're not iterating over any embedded arrays, so just fill the slot and return */
+			FillTupleSlot(collectionDocument, NULL, columnMappingHash, columnValues, columnNulls);
+			ExecStoreVirtualTuple(tupleSlot);
+
+			/* EXIT */
+			return tupleSlot;
 		}
 		else
 		{
-			ereport(INFO, (errmsg_internal("Mongo cursor exhausted")));
+			ereport(INFO, (errmsg_internal("Getting embedded array")));
+			/* We're iterating over an embedded array. */
+			if(!arrayCursor)
+			{
+				ereport(INFO, (errmsg_internal("Getting array cursor from collection document")));
+				bson_iterator bsonIterator = { NULL, 0 };
+				bson_iterator_init(&bsonIterator, collectionDocument);
+				bsonCursorStatus = bson_find(&bsonIterator, collectionDocument, arrayFieldName);
+
+				if (bsonCursorStatus == BSON_ARRAY) {
+					arrayCursor = bson_iterator_create();
+					bson_iterator_subiterator(&bsonIterator, arrayCursor);
+				}
+				else
+				{
+					ereport(INFO, (errmsg_internal("Can't find array on collection document.")));
+					/* The embedded array field is not present on this document.  Next! */
+					executionState->parentDocument = collectionDocument = NULL;
+					continue;
+				}
+			}
+
+			/* Now we have an array cursor */
+
+			bsonCursorStatus = bson_iterator_next(arrayCursor);
+			while(bsonCursorStatus && bsonCursorStatus != BSON_OBJECT)
+			{
+				ereport(INFO, (errmsg_internal("Didn't get an object from array cursor.  Trying again.")));
+				bsonCursorStatus = bson_iterator_next(arrayCursor);
+			}
+
+			if (bsonCursorStatus != BSON_OBJECT) 
+			{
+				ereport(INFO, (errmsg_internal("Ran out of documents in array cursor.  Freeing it and moving to next collection document.")));
+				/* No more objects in this array.  Next document! */
+				executionState->parentDocument = collectionDocument = NULL;
+				bson_iterator_dispose(arrayCursor);
+				executionState->arrayCursor = arrayCursor = NULL;
+				continue;
+			}
+
+			/* Now we have a document from the embedded array */
+			ereport(INFO, (errmsg_internal("Found document in array")));
+			bson *arrayDocument = bson_create();
+			bson_iterator_subobject(arrayCursor, arrayDocument);
+			ereport(INFO, (errmsg_internal("Filling tuple slot from array document")));
+			FillTupleSlot(arrayDocument, collectionDocument, columnMappingHash,
+					      columnValues, columnNulls);
+			ereport(INFO, (errmsg_internal("Freeing array document")));
+			bson_dispose(arrayDocument);
+			ereport(INFO, (errmsg_internal("Storing tuple")));
+			ExecStoreVirtualTuple(tupleSlot);
+
+			executionState->parentDocument = collectionDocument;
+			executionState->arrayCursor = arrayCursor;
+
+			return tupleSlot;
 		}
 	}
-
-	return tupleSlot;
 }
 
 
@@ -474,6 +558,7 @@ MongoEndForeignScan(ForeignScanState *scanState)
 static void
 MongoReScanForeignScan(ForeignScanState *scanState)
 {
+	ereport(INFO, (errmsg_internal("Rescanning")));
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
 	mongo *mongoConnection = executionState->mongoConnection;
 	MongoFdwOptions *mongoFdwOptions = NULL;
@@ -484,6 +569,15 @@ MongoReScanForeignScan(ForeignScanState *scanState)
 	/* close down the old cursor */
 	mongo_cursor_destroy(executionState->mongoCursor);
 	mongo_cursor_dispose(executionState->mongoCursor);
+
+	executionState->parentDocument = NULL;
+
+	if (executionState->arrayCursor)
+	{
+		ereport(INFO, (errmsg_internal("Freeing arrayCursor")));
+		bson_iterator_dispose(executionState->arrayCursor);
+		executionState->arrayCursor = NULL;
+	}
 
 	/* reconstruct full collection name */
 	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
@@ -682,6 +776,7 @@ MongoGetOptions(Oid foreignTableId)
 	int32 portNumber = 0;
 	char *databaseName = NULL;
 	char *collectionName = NULL;
+	char *fieldName = NULL;
 	char *username = NULL;
 	char *password = NULL;
 	char *useAuthStr = NULL;
@@ -725,6 +820,8 @@ MongoGetOptions(Oid foreignTableId)
 	{
 		collectionName = get_rel_name(optionList);
 	}
+	
+	fieldName = MongoGetOptionValue(optionList, OPTION_NAME_FIELD);
 
 	useAuthStr = MongoGetOptionValue(optionList, OPTION_NAME_USE_AUTH);
 	if (useAuthStr != NULL)
@@ -747,6 +844,7 @@ MongoGetOptions(Oid foreignTableId)
 	mongoFdwOptions->portNumber = portNumber;
 	mongoFdwOptions->databaseName = databaseName;
 	mongoFdwOptions->collectionName = collectionName;
+	mongoFdwOptions->fieldName = fieldName;
 	mongoFdwOptions->username = username;
 	mongoFdwOptions->password = password;
 	mongoFdwOptions->useAuth = useAuth;
@@ -840,23 +938,30 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
  * the function converts the value and fills the corresponding tuple position.
  */
 static void
-FillTupleSlot(const bson *bsonDocument, HTAB *columnMappingHash,
-			  Datum *columnValues, bool *columnNulls)
+FillTupleSlot(const bson *bsonDocument, const bson *parentDocument,
+			  HTAB *columnMappingHash, Datum *columnValues, bool *columnNulls)
 {
-	FillTupleSlotHelper(bsonDocument, columnMappingHash, columnValues,
-			columnNulls, NULL);
+	FillTupleSlotHelper(bsonDocument, parentDocument, columnMappingHash,
+			columnValues, columnNulls, NULL);
 }
 
 static void
-FillTupleSlotHelper(const bson *bsonDocument, HTAB *columnMappingHash,
-			  Datum *columnValues, bool *columnNulls, const char *prefix)
+FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
+		            HTAB *columnMappingHash, Datum *columnValues,
+					bool *columnNulls, const char *prefix)
 {
+	if(parentDocument)
+	{
+		FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues, columnNulls, "parent");
+	}
+
 	bson_iterator bsonIterator = { NULL, 0 };
 	bson_iterator_init(&bsonIterator, bsonDocument);
 
 	while (bson_iterator_next(&bsonIterator))
 	{
 		const char *bsonKey = bson_iterator_key(&bsonIterator);
+		ereport(INFO, (errmsg_internal("Next document field: %s", bsonKey)));
 		bson_type bsonType = bson_iterator_type(&bsonIterator);
 
 		ColumnMapping *columnMapping = NULL;
@@ -871,7 +976,7 @@ FillTupleSlotHelper(const bson *bsonDocument, HTAB *columnMappingHash,
 			/* for fields in nested BSON objects, use fully qualified field
 			 * name to check the column mapping */
 			StringInfo qualifiedKeyInfo = makeStringInfo();
-			appendStringInfo(qualifiedKeyInfo, "%s$%s", prefix, bsonKey);
+			appendStringInfo(qualifiedKeyInfo, "%s.%s", prefix, bsonKey);
 			qualifiedKey = qualifiedKeyInfo->data;
 		}
 		else
@@ -889,12 +994,15 @@ FillTupleSlotHelper(const bson *bsonDocument, HTAB *columnMappingHash,
 		{
 			bson *sub = bson_create();
 			bson_iterator_subobject(&bsonIterator, sub);
-			FillTupleSlotHelper(sub, columnMappingHash, columnValues,
-					columnNulls, qualifiedKey);
+			ereport(INFO, (errmsg_internal("Recursing into sub-document: %p", sub)));
+			FillTupleSlotHelper(sub, parentDocument, columnMappingHash,
+					columnValues, columnNulls, qualifiedKey);
+			ereport(INFO, (errmsg_internal("Destroying sub-document: %p, %p", sub, sub->data)));
 			bson_dispose(sub);
+			ereport(INFO, (errmsg_internal("Destroyed sub-document")));
 			continue;
 		}
-		
+
 		/* if no corresponding column or null bson value, continue */
 		if (columnMapping == NULL || bsonType == BSON_NULL)
 		{
@@ -939,6 +1047,7 @@ FillTupleSlotHelper(const bson *bsonDocument, HTAB *columnMappingHash,
 			columnNulls[columnIndex] = false;
 		}
 	}
+	ereport(INFO, (errmsg_internal("Finished document.")));
 }
 
 
@@ -1226,6 +1335,12 @@ MongoFreeScanState(MongoFdwExecState *executionState)
 
 	mongo_cursor_destroy(executionState->mongoCursor);
 	mongo_cursor_dispose(executionState->mongoCursor);
+
+	if (executionState->arrayCursor)
+	{
+		ereport(INFO, (errmsg_internal("Freeing arrayCursor")));
+		bson_iterator_dispose(executionState->arrayCursor);
+	}
 
 	/* also close the connection to mongo server */
 	mongo_destroy(executionState->mongoConnection);

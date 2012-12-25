@@ -26,12 +26,12 @@
 #include "nodes/relation.h"
 #include "utils/timestamp.h"
 
-
 /* Defines for valid option names */
 #define OPTION_NAME_ADDRESS "address"
 #define OPTION_NAME_PORT "port"
 #define OPTION_NAME_DATABASE "database"
 #define OPTION_NAME_COLLECTION "collection"
+#define OPTION_NAME_FIELD "field"
 #define OPTION_NAME_USERNAME "username"
 #define OPTION_NAME_PASSWORD "password"
 #define OPTION_NAME_USE_AUTH "use_auth"
@@ -64,7 +64,7 @@ typedef struct MongoValidOption
 
 
 /* Array of options that are valid for mongo_fdw */
-static const uint32 ValidOptionCount = 7;
+static const uint32 ValidOptionCount = 8;
 static const MongoValidOption ValidOptionArray[] =
 {
 	/* foreign server options */
@@ -75,6 +75,7 @@ static const MongoValidOption ValidOptionArray[] =
 	/* foreign table options */
 	{ OPTION_NAME_DATABASE, ForeignTableRelationId },
 	{ OPTION_NAME_COLLECTION, ForeignTableRelationId },
+	{ OPTION_NAME_FIELD, ForeignTableRelationId },
 
 	  /* user mapping options */
 	{ OPTION_NAME_USERNAME, UserMappingRelationId },
@@ -93,6 +94,7 @@ typedef struct MongoFdwOptions
 	int32 portNumber;
 	char *databaseName;
 	char *collectionName;
+	char *fieldName;
 	char *username;
 	char *password;
 	bool useAuth;
@@ -109,6 +111,9 @@ typedef struct MongoFdwExecState
 	struct HTAB *columnMappingHash;
 	mongo *mongoConnection;
 	mongo_cursor *mongoCursor;
+	bson *parentDocument;
+	char *arrayFieldName;
+	bson_iterator *arrayCursor;
 	bson *queryDocument;
 
 } MongoFdwExecState;
