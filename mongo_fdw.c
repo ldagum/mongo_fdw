@@ -383,7 +383,7 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 static bson_type 
 BsonFindSubobject(bson_iterator *bsonIterator, bson *bsonObject, const char* path)
 {
-	bson_type bsonCursorStatus = NULL;
+	bson_type bsonCursorStatus;
 	char *dot = strchr(path, '.');
 	if (dot)
 	{
@@ -424,7 +424,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	HTAB *columnMappingHash = executionState->columnMappingHash;
 	bson_iterator *arrayCursor = executionState->arrayCursor;
 	int32 mongoCursorStatus = MONGO_ERROR;
-	bson_type bsonCursorStatus = NULL;
+	bson_type bsonCursorStatus;
 	bson *collectionDocument = executionState->parentDocument;
 
 	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
