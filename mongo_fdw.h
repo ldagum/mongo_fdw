@@ -138,7 +138,7 @@ typedef struct ColumnMapping
 
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
-extern bson * QueryDocument(Oid relationId, List *opExpressionList);
+extern bson * QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */

@@ -17,6 +17,7 @@
 #include "mongo_fdw.h"
 
 #include "catalog/pg_type.h"
+#include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/relation.h"
 #include "optimizer/var.h"
@@ -165,7 +166,7 @@ FindArgumentOfType(List *argumentList, NodeTag argumentType)
  * "l_shipdate: { $gte: new Date(757382400000), $lt: new Date(788918400000) }".
  */
 bson *
-QueryDocument(Oid relationId, List *opExpressionList)
+QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions)
 {
 	List *equalityOperatorList = NIL;
 	List *comparisonOperatorList = NIL;
@@ -174,6 +175,9 @@ QueryDocument(Oid relationId, List *opExpressionList)
 	ListCell *columnCell = NULL;
 	bson *queryDocument = NULL;
 	int documentStatus = BSON_OK;
+	char *prefix = "parent.";
+	int prefix_len = strlen(prefix);
+	StringInfo columnNameInfo = NULL;
 
 	queryDocument = bson_create();
 	bson_init(queryDocument);
@@ -199,6 +203,20 @@ QueryDocument(Oid relationId, List *opExpressionList)
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
+		if (mongoFdwOptions->fieldName != NULL) {
+			if (strncmp(columnName, prefix, prefix_len) == 0)
+			{
+				columnName = columnName + prefix_len; 
+			}
+			else
+			{
+				columnNameInfo = makeStringInfo();
+				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+								 columnName);
+				columnName = columnNameInfo->data;
+			}
+		}
+		ereport(INFO, (errmsg_internal("Column name: %s", columnName)));
 
 		AppendConstantValue(queryDocument, columnName, constant);
 	}
@@ -223,6 +241,19 @@ QueryDocument(Oid relationId, List *opExpressionList)
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
+		if (mongoFdwOptions->fieldName != NULL) {
+			if (strncmp(columnName, prefix, prefix_len) == 0)
+			{
+				columnName = columnName + prefix_len; 
+			}
+			else
+			{
+				columnNameInfo = makeStringInfo();
+				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+								 columnName);
+				columnName = columnNameInfo->data;
+			}
+		}
 
 		/* find all expressions that correspond to the column */
 		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);

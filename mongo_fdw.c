@@ -193,6 +193,10 @@ MongoPlanForeignScan(Oid foreignTableId, PlannerInfo *root, RelOptInfo *baserel)
 	Const *queryBuffer = NULL;
 	List *columnList = NIL;
 	double documentCount = 0.0;
+	MongoFdwOptions *mongoFdwOptions = NULL;
+
+
+	mongoFdwOptions = MongoGetOptions(foreignTableId);
 
 	/*
 	 * We construct the query document to have MongoDB filter its rows. We could
@@ -201,7 +205,7 @@ MongoPlanForeignScan(Oid foreignTableId, PlannerInfo *root, RelOptInfo *baserel)
 	 * the MongoDB server-side, so we instead filter out columns on our side.
 	 */
 	opExpressionList = ApplicableOpExpressionList(baserel);
-	queryDocument = QueryDocument(foreignTableId, opExpressionList);
+	queryDocument = QueryDocument(foreignTableId, opExpressionList, mongoFdwOptions);
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
