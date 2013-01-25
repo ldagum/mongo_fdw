@@ -56,10 +56,13 @@ static void FillTupleSlot(const bson *currentDocument, const bson *parentDocumen
 static void FillTupleSlotHelper(const bson *currentDocument, const bson *parentDocument,
 							    HTAB *columnMappingHash, Datum *columnValues,
 							    bool *columnNulls, const char *prefix);
+static void FillTupleSlotColumn(const ColumnMapping *columnMapping,
+					const bson_type bsonType, bson_iterator *bsonIterator,
+					Datum *columnValues, bool *columnNulls);
 static bool ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId);
 static Datum ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId);
-static Datum ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId,
-						 int32 columnTypeMod);
+static Datum ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType,
+						 Oid columnTypeId, int32 columnTypeMod);
 static void MongoFreeScanState(MongoFdwExecState *executionState);
 
 
@@ -984,7 +987,8 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 {
 	if(parentDocument)
 	{
-		FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues, columnNulls, "parent");
+		FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues,
+							columnNulls, "parent");
 	}
 
 	bson_iterator bsonIterator = { NULL, 0 };
@@ -997,9 +1001,6 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 		bson_type bsonType = bson_iterator_type(&bsonIterator);
 
 		ColumnMapping *columnMapping = NULL;
-		Oid columnTypeId = InvalidOid;
-		Oid columnArrayTypeId = InvalidOid;
-		bool compatibleTypes = false;
 		bool handleFound = false;
 		const char *qualifiedKey = NULL;
 
@@ -1016,11 +1017,6 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 			qualifiedKey = bsonKey;
 		}
 
-		/* look up the corresponding column for this bson key */
-		void *hashKey = (void *) qualifiedKey;
-		columnMapping = (ColumnMapping *) hash_search(columnMappingHash, hashKey,
-														HASH_FIND, &handleFound);
-
 		/* recurse into nested objects */
 		if (bsonType == BSON_OBJECT)
 		{
@@ -1028,60 +1024,91 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 			bson_iterator_subobject(&bsonIterator, sub);
 			ereport(DEBUG2, (errmsg_internal("Recursing into sub-document: %p", sub)));
 			FillTupleSlotHelper(sub, parentDocument, columnMappingHash,
-					columnValues, columnNulls, qualifiedKey);
-			ereport(DEBUG2, (errmsg_internal("Destroying sub-document: %p, %p", sub, sub->data)));
+								columnValues, columnNulls, qualifiedKey);
+			ereport(DEBUG2, (errmsg_internal("Destroying sub-document: %p, %p", sub,
+											 sub->data)));
 			bson_dispose(sub);
 			ereport(DEBUG2, (errmsg_internal("Destroyed sub-document")));
 			continue;
 		}
 
-		/* if no corresponding column or null bson value, continue */
-		if (columnMapping == NULL || bsonType == BSON_NULL)
-		{
-			continue;
-		}
+		/* look up the corresponding column for this bson key */
+		void *hashKey = (void *) qualifiedKey;
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  hashKey, HASH_FIND,
+													  &handleFound);
+		FillTupleSlotColumn(columnMapping, bsonType, &bsonIterator,
+							columnValues, columnNulls);
 
-		/* check if columns have compatible types */
-		columnTypeId = columnMapping->columnTypeId;
-		columnArrayTypeId = columnMapping->columnArrayTypeId;
-
-		if (OidIsValid(columnArrayTypeId) && bsonType == BSON_ARRAY)
+		if (bsonType == BSON_OID)
 		{
-			compatibleTypes = true;
-		}
-		else
-		{
-			compatibleTypes = ColumnTypesCompatible(bsonType, columnTypeId);
-		}
-
-		/* if types are incompatible, leave this column null */
-		if (!compatibleTypes)
-		{
-			continue;
-		}
-
-		/* fill in corresponding column value and null flag */
-		if (OidIsValid(columnArrayTypeId))
-		{
-			int32 columnIndex = columnMapping->columnIndex;
-
-			columnValues[columnIndex] = ColumnValueArray(&bsonIterator,
-														 columnArrayTypeId);
-			columnNulls[columnIndex] = false;
-		}
-		else
-		{
-			int32 columnIndex = columnMapping->columnIndex;
-			Oid columnTypeMod = columnMapping->columnTypeMod;
-
-			columnValues[columnIndex] = ColumnValue(&bsonIterator,
-													columnTypeId, columnTypeMod);
-			columnNulls[columnIndex] = false;
+			StringInfo generatedTimeKeyInfo = makeStringInfo();
+			appendStringInfo(generatedTimeKeyInfo, "%s.generated",
+							 qualifiedKey);
+			columnMapping = (ColumnMapping *) hash_search(
+				columnMappingHash, (void *)generatedTimeKeyInfo->data,
+				HASH_FIND, &handleFound);
+			FillTupleSlotColumn(columnMapping, bsonType, &bsonIterator,
+								columnValues, columnNulls);
 		}
 	}
+
+
 	ereport(DEBUG2, (errmsg_internal("Finished document.")));
 }
 
+static void
+FillTupleSlotColumn(const ColumnMapping *columnMapping,
+					const bson_type bsonType, bson_iterator *bsonIterator,
+					Datum *columnValues, bool *columnNulls)
+{
+	Oid columnTypeId = InvalidOid;
+	Oid columnArrayTypeId = InvalidOid;
+	bool compatibleTypes = false;
+	/* if no corresponding column or null bson value, continue */
+	if (columnMapping == NULL || bsonType == BSON_NULL)
+	{
+		return;
+	}
+
+	/* check if columns have compatible types */
+	columnTypeId = columnMapping->columnTypeId;
+	columnArrayTypeId = columnMapping->columnArrayTypeId;
+
+	if (OidIsValid(columnArrayTypeId) && bsonType == BSON_ARRAY)
+	{
+		compatibleTypes = true;
+	}
+	else
+	{
+		compatibleTypes = ColumnTypesCompatible(bsonType, columnTypeId);
+	}
+
+	/* if types are incompatible, leave this column null */
+	if (!compatibleTypes)
+	{
+		return;
+	}
+
+	/* fill in corresponding column value and null flag */
+	if (OidIsValid(columnArrayTypeId))
+	{
+		int32 columnIndex = columnMapping->columnIndex;
+
+		columnValues[columnIndex] = ColumnValueArray(bsonIterator,
+													 columnArrayTypeId);
+		columnNulls[columnIndex] = false;
+	}
+	else
+	{
+		int32 columnIndex = columnMapping->columnIndex;
+		Oid columnTypeMod = columnMapping->columnTypeMod;
+
+		columnValues[columnIndex] = ColumnValue(bsonIterator, bsonType,
+												columnTypeId, columnTypeMod);
+		columnNulls[columnIndex] = false;
+	}
+}
 
 /*
  * ColumnTypesCompatible checks if the given BSON type can be converted to the
@@ -1143,7 +1170,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			if (bsonType == BSON_DATE)
+			if (bsonType == BSON_DATE || bsonType == BSON_OID)
 			{
 				compatibleTypes = true;
 			}
@@ -1208,7 +1235,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 		}
 
 		/* use default type modifier (0) to convert column value */
-		columnValueArray[arrayIndex] = ColumnValue(&bsonSubIterator, valueTypeId, 0);
+		columnValueArray[arrayIndex] = ColumnValue(&bsonSubIterator, bsonType, valueTypeId, 0);
 		arrayIndex++;
 	}
 
@@ -1227,7 +1254,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
  * datum. The function then returns this datum.
  */
 static Datum
-ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
+ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTypeId, int32 columnTypeMod)
 {
 	Datum columnValue = 0;
 
@@ -1320,7 +1347,28 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		}
 		case DATEOID:
 		{
-			int64 valueMillis = bson_iterator_date(bsonIterator);
+			int64 valueMillis = 0;
+			switch (bsonType)
+			{
+				case BSON_DATE:
+				{
+					valueMillis = bson_iterator_date(bsonIterator);
+					break;
+				}
+				case BSON_OID:
+				{
+					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+					valueMillis = bson_oid_generated_time(oid) * 1000;
+					break;
+				}
+				default:
+				{
+					ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+									errmsg("cannot convert bson type to column type"),
+									errhint("Column type: %u", (uint32) columnTypeId)));
+					break;
+				}
+			}
 			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
@@ -1330,7 +1378,28 @@ ColumnValue(bson_iterator *bsonIterator, Oid columnTypeId, int32 columnTypeMod)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			int64 valueMillis = bson_iterator_date(bsonIterator);
+			int64 valueMillis = 0;
+			switch (bsonType)
+			{
+				case BSON_DATE:
+				{
+					valueMillis = bson_iterator_date(bsonIterator);
+					break;
+				}
+				case BSON_OID:
+				{
+					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+					valueMillis = bson_oid_generated_time(oid) * 1000;
+					break;
+				}
+				default:
+				{
+					ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+									errmsg("cannot convert bson type to column type"),
+									errhint("Column type: %u", (uint32) columnTypeId)));
+					break;
+				}
+			}
 			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
 
 			/* overlook type modifiers for timestamp */

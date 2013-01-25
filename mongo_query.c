@@ -36,7 +36,7 @@ static List * EqualityOperatorList(List *operatorList);
 static List * UniqueColumnList(List *operatorList);
 static List * ColumnOperatorList(Var *column, List *operatorList);
 static void AppendConstantValue(bson *queryDocument, const char *keyName,
-								Const *constant);
+								const bson_type toBsonType, Const *constant);
 
 
 /*
@@ -176,6 +176,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 	bson *queryDocument = NULL;
 	int documentStatus = BSON_OK;
 	char *prefix = "parent.";
+	char *oidGeneratedKeySuffix = ".generated";
 	int prefix_len = strlen(prefix);
 	StringInfo columnNameInfo = NULL;
 
@@ -196,6 +197,10 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		OpExpr *equalityOperator = (OpExpr *) lfirst(equalityOperatorCell);
 		Oid columnId = InvalidOid;
 		char *columnName = NULL;
+		int suffixLen = strlen(oidGeneratedKeySuffix);
+		int columnNameLen = 0;
+		char *dot = NULL;
+		bson_type toBsonType = -1;
 
 		List *argumentList = equalityOperator->args;
 		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
@@ -218,7 +223,21 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		}
 		ereport(INFO, (errmsg_internal("Column name: %s", columnName)));
 
-		AppendConstantValue(queryDocument, columnName, constant);
+		columnNameLen = strlen(columnName);
+		if (columnNameLen > suffixLen &&
+			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+		{
+			dot = columnName + (columnNameLen - suffixLen);
+			/* Chop .generated off of the keyname to get the oid name */
+			*dot = '\0';
+			toBsonType = BSON_OID;
+		}
+
+		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
+
+		if (dot) {
+			*dot = '.';
+		}
 	}
 
 	/*
@@ -238,6 +257,10 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		char *columnName = NULL;
 		List *columnOperatorList = NIL;
 		ListCell *columnOperatorCell = NULL;
+		int suffixLen = strlen(oidGeneratedKeySuffix);
+		int columnNameLen = 0;
+		char *dot = NULL;
+		bson_type toBsonType = -1;
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
@@ -255,11 +278,25 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 			}
 		}
 
+		columnNameLen = strlen(columnName);
+		if (columnNameLen > suffixLen &&
+			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+		{
+			dot = columnName + (columnNameLen - suffixLen);
+			/* Chop .generated off of the keyname to get the oid name */
+			*dot = '\0';
+			toBsonType = BSON_OID;
+		}
+
 		/* find all expressions that correspond to the column */
 		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
 
 		/* for comparison expressions, start a sub-document */
 		bson_append_start_object(queryDocument, columnName);
+
+		if (dot) {
+			*dot = '.';
+		}
 
 		foreach(columnOperatorCell, columnOperatorList)
 		{
@@ -273,7 +310,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 			operatorName = get_opname(columnOperator->opno);
 			mongoOperatorName = MongoOperatorName(operatorName);
 
-			AppendConstantValue(queryDocument, mongoOperatorName, constant);
+			AppendConstantValue(queryDocument, mongoOperatorName, toBsonType, constant);
 		}
 
 		bson_append_finish_object(queryDocument);
@@ -403,7 +440,8 @@ ColumnOperatorList(Var *column, List *operatorList)
  * its MongoDB equivalent.
  */
 static void
-AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
+AppendConstantValue(bson *queryDocument, const char *keyName,
+					const bson_type toBsonType, Const *constant)
 {
 	Datum constantValue = constant->constvalue;
 	Oid constantTypeId = constant->consttype;
@@ -495,8 +533,20 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			Timestamp valueTimestamp = DatumGetTimestamp(valueDatum);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
-
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			if (toBsonType == BSON_OID)
+			{
+				/* Generate an oid with a generated time at the time we're querying */
+				bson_oid_t oid;
+				time_t t = valueMilliSecs / 1000;
+				bson_big_endian32(&oid.ints[0], &t);
+				oid.ints[1] = 0;
+				oid.ints[2] = 0;
+				bson_append_oid(queryDocument, keyName, &oid);
+			}
+			else
+			{
+				bson_append_date(queryDocument, keyName, valueMilliSecs);
+			}
 			break;
 		}
 		case TIMESTAMPOID:
@@ -505,8 +555,20 @@ AppendConstantValue(bson *queryDocument, const char *keyName, Const *constant)
 			Timestamp valueTimestamp = DatumGetTimestamp(constantValue);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
-
-			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			if (toBsonType == BSON_OID)
+			{
+				/* Generate an oid with a generated time at the time we're querying */
+				bson_oid_t oid;
+				time_t t = valueMilliSecs / 1000;
+				bson_big_endian32(&oid.ints[0], &t);
+				oid.ints[1] = 0;
+				oid.ints[2] = 0;
+				bson_append_oid(queryDocument, keyName, &oid);
+			}
+			else
+			{
+				bson_append_date(queryDocument, keyName, valueMilliSecs);
+			}
 			break;
 		}
 		default:
