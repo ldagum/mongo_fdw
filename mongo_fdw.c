@@ -1358,7 +1358,10 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+					time_t t = bson_oid_generated_time(oid);
+					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
 					valueMillis = bson_oid_generated_time(oid) * 1000L;
+					ereport(INFO, (errmsg_internal("Converted to millis: %ld", valueMillis)));
 					break;
 				}
 				default:
@@ -1369,7 +1372,9 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 					break;
 				}
 			}
-			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
+			int64 valueMicros = (valueMillis * 1000L);
+			ereport(INFO, (errmsg_internal("Converted to micros: %ld", valueMicros)));
+			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
 			columnValue = DirectFunctionCall1(timestamp_date, timestampDatum);
@@ -1389,7 +1394,10 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
-					valueMillis = bson_oid_generated_time(oid) * 1000;
+					time_t t = bson_oid_generated_time(oid);
+					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
+					valueMillis = bson_oid_generated_time(oid) * 1000L;
+					ereport(INFO, (errmsg_internal("Converted to millis: %ld", valueMillis)));
 					break;
 				}
 				default:
@@ -1400,7 +1408,9 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 					break;
 				}
 			}
-			int64 timestamp = (valueMillis * 1000L) - POSTGRES_TO_UNIX_EPOCH_USECS;
+			int64 valueMicros = (valueMillis * 1000L);
+			ereport(INFO, (errmsg_internal("Converted to micros: %ld", valueMicros)));
+			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 
 			/* overlook type modifiers for timestamp */
 			columnValue = TimestampGetDatum(timestamp);
