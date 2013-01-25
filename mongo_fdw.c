@@ -1358,14 +1358,7 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
-					char oid_str[25];
-					bson_oid_to_string(oid, oid_str);
-					ereport(INFO, (errmsg_internal("Got oid: %s", oid_str)));
-					time_t t = 0;
-					t = bson_oid_generated_time(oid);
-					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
-					valueMillis = bson_oid_generated_time(oid) * 1000L;
-					ereport(INFO, (errmsg_internal("Converted to millis: %ld", valueMillis)));
+					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
 					break;
 				}
 				default:
@@ -1377,7 +1370,6 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				}
 			}
 			int64 valueMicros = (valueMillis * 1000L);
-			ereport(INFO, (errmsg_internal("Converted to micros: %ld", valueMicros)));
 			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
@@ -1398,14 +1390,7 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
-					char oid_str[25];
-					bson_oid_to_string(oid, oid_str);
-					ereport(INFO, (errmsg_internal("Got oid: %s", oid_str)));
-					time_t t = 0;
-					t = bson_oid_generated_time(oid);
-					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
-					valueMillis = bson_oid_generated_time(oid) * 1000L;
-					ereport(INFO, (errmsg_internal("Converted to millis: %ld", valueMillis)));
+					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
 					break;
 				}
 				default:
@@ -1417,7 +1402,6 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				}
 			}
 			int64 valueMicros = (valueMillis * 1000L);
-			ereport(INFO, (errmsg_internal("Converted to micros: %ld", valueMicros)));
 			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 
 			/* overlook type modifiers for timestamp */
