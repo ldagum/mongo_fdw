@@ -1358,7 +1358,7 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
-					valueMillis = bson_oid_generated_time(oid) * 1000;
+					valueMillis = bson_oid_generated_time(oid) * 1000L;
 					break;
 				}
 				default:
