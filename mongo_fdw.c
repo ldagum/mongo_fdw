@@ -1358,6 +1358,9 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+					char oid_str[25];
+					bson_oid_to_string(oid, oid_str);
+					ereport(INFO, (errmsg_internal("Got oid: %s", oid_str)));
 					time_t t = bson_oid_generated_time(oid);
 					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
 					valueMillis = bson_oid_generated_time(oid) * 1000L;
@@ -1394,6 +1397,9 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 				case BSON_OID:
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+					char oid_str[25];
+					bson_oid_to_string(oid, oid_str);
+					ereport(INFO, (errmsg_internal("Got oid: %s", oid_str)));
 					time_t t = bson_oid_generated_time(oid);
 					ereport(INFO, (errmsg_internal("Got timestamp from oid: %ld", t)));
 					valueMillis = bson_oid_generated_time(oid) * 1000L;
