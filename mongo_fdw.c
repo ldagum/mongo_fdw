@@ -61,8 +61,8 @@ static void FillTupleSlotColumn(const ColumnMapping *columnMapping,
 					Datum *columnValues, bool *columnNulls);
 static bool ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId);
 static Datum ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId);
-static Datum ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType,
-						 Oid columnTypeId, int32 columnTypeMod);
+static ColumnValue CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType,
+									 Oid columnTypeId, int32 columnTypeMod);
 static void MongoFreeScanState(MongoFdwExecState *executionState);
 
 
@@ -1104,9 +1104,13 @@ FillTupleSlotColumn(const ColumnMapping *columnMapping,
 		int32 columnIndex = columnMapping->columnIndex;
 		Oid columnTypeMod = columnMapping->columnTypeMod;
 
-		columnValues[columnIndex] = ColumnValue(bsonIterator, bsonType,
-												columnTypeId, columnTypeMod);
-		columnNulls[columnIndex] = false;
+		ColumnValue columnValue = CoerceColumnValue(bsonIterator, bsonType,
+										columnTypeId, columnTypeMod);
+		if (!columnValue.isNull)
+		{
+			columnValues[columnIndex] = columnValue.datum;
+			columnNulls[columnIndex] = false;
+		}
 	}
 }
 
@@ -1128,7 +1132,7 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case FLOAT8OID: case NUMERICOID:
 		{
 			if (bsonType == BSON_INT || bsonType == BSON_LONG ||
-				bsonType == BSON_DOUBLE)
+				bsonType == BSON_DOUBLE || bsonType == BSON_STRING)
 			{
 				compatibleTypes = true;
 			}
@@ -1137,7 +1141,8 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case BOOLOID:
 		{
 			if (bsonType == BSON_INT || bsonType == BSON_LONG ||
-				bsonType == BSON_DOUBLE || bsonType == BSON_BOOL)
+				bsonType == BSON_DOUBLE || bsonType == BSON_BOOL ||
+				bsonType == BSON_STRING)
 			{
 				compatibleTypes = true;
 			}
@@ -1147,7 +1152,9 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case VARCHAROID:
 		case TEXTOID:
 		{
-			if (bsonType == BSON_STRING)
+			if (bsonType == BSON_INT || bsonType == BSON_LONG ||
+				bsonType == BSON_DOUBLE || bsonType == BSON_BOOL ||
+				bsonType == BSON_STRING || bsonType == BSON_OID)
 			{
 				compatibleTypes = true;
 			}
@@ -1170,7 +1177,8 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 		{
-			if (bsonType == BSON_DATE || bsonType == BSON_OID)
+			if (bsonType == BSON_DATE || bsonType == BSON_OID ||
+				bsonType == BSON_LONG || bsonType == BSON_DOUBLE)
 			{
 				compatibleTypes = true;
 			}
@@ -1228,6 +1236,12 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 			continue;
 		}
 
+		ColumnValue columnValue = CoerceColumnValue(&bsonSubIterator, bsonType, valueTypeId, 0);
+		if (columnValue.isNull)
+		{
+			continue;
+		}
+
 		if (arrayIndex >= arrayCapacity)
 		{
 			arrayCapacity *= arrayGrowthFactor;
@@ -1235,7 +1249,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 		}
 
 		/* use default type modifier (0) to convert column value */
-		columnValueArray[arrayIndex] = ColumnValue(&bsonSubIterator, bsonType, valueTypeId, 0);
+		columnValueArray[arrayIndex] = columnValue.datum;
 		arrayIndex++;
 	}
 
@@ -1247,88 +1261,328 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 	return columnValueDatum;
 }
 
+/*
+ * ParseLong attempts to parse a number from value using strtol.
+ * If the string is null, is empty, or has any characters that are not
+ * valid for a base 10 number, the function returns false.
+ */
+static bool
+ParseLong(const char *value, long *result)
+{
+	long temp;
+	char *invalidChar;
+	if(!*value)
+	{
+		return false;
+	}
+	temp = strtol(value, &invalidChar, 10);
+	if (*invalidChar)
+	{
+		return false;
+	}
+	*result = temp;
+	return true;
+}
+
+/*
+ * ParseDOuble attempts to parse a number from value using strtod.
+ * If the string is null, is empty, or has any characters that are not
+ * valid for a base 10 number, the function returns false.
+ */
+static bool
+ParseDouble(const char *value, double *result)
+{
+	double temp;
+	char *invalidChar;
+	if(!*value)
+	{
+		return false;
+	}
+	temp = strtod(value, &invalidChar);
+	if (*invalidChar)
+	{
+		return false;
+	}
+	*result = temp;
+	return true;
+}
+
+static bool
+BsonLong(bson_iterator *bsonIterator, const bson_type bsonType, long *result)
+{
+	switch(bsonType)
+	{
+		case BSON_STRING:
+		{
+			long value = 0;
+			if(ParseLong(bson_iterator_string(bsonIterator), &value)) {
+				*result = value;
+				return true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		{
+			*result = bson_iterator_long(bsonIterator);
+			return true;
+		}
+		default:
+		{
+			return false;
+		}
+	}
+}
+
+static bool
+BsonDouble(bson_iterator *bsonIterator, const bson_type bsonType, double *result)
+{
+	switch(bsonType)
+	{
+		case BSON_STRING:
+		{
+			double value = 0;
+			if(ParseDouble(bson_iterator_string(bsonIterator), &value)) {
+				*result = value;
+				return true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		{
+			*result = bson_iterator_double(bsonIterator);
+			return true;
+		}
+		default:
+		{
+			return false;
+			break;
+		}
+	}
+}
+
+static const char *
+BsonString(bson_iterator *bsonIterator, const bson_type bsonType)
+{
+	char *result;
+	switch(bsonType)
+	{
+		case BSON_STRING:
+		{
+			result = bson_iterator_string(bsonIterator);
+			break;
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		{
+			long value = bson_iterator_long(bsonIterator);
+			/* Maximum length of a 64 bit number is 20 digits.  Add one for 
+			 * sign and another for \0. */
+			result = palloc0(22 * sizeof(char));
+			snprintf(result, 22, "%ld", value);
+			break;
+		}
+		case BSON_DOUBLE:
+		{
+			double value = bson_iterator_double(bsonIterator);
+			/* Executive decision.  You get 20 digits for floats when
+			 * converting to a string.  Want more?  Just use a real double
+			 * precision field.
+			 */
+			result = palloc0(22 * sizeof(char));
+			snprintf(result, 22, "%g", value);
+			break;
+		}
+		case BSON_BOOL:
+		{
+			bool value = bson_iterator_bool(bsonIterator);
+			if(value)
+			{
+				result = "true";
+			}
+			else
+			{
+				result = "false";
+			}
+			break;
+		}
+		case BSON_OID:
+		{
+			bson_oid_t *oid = bson_iterator_oid(bsonIterator);
+			result = palloc0(25 * sizeof(char));
+			bson_oid_to_string(oid, result);
+			break;
+		}
+		default:
+		{
+			result = "";
+			break;
+		}
+	}
+	return result;
+}
 
 /*
  * ColumnValue uses column type information to read the current value pointed to
  * by the BSON iterator, and converts this value to the corresponding PostgreSQL
  * datum. The function then returns this datum.
  */
-static Datum
-ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTypeId, int32 columnTypeMod)
+static ColumnValue
+CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTypeId, int32 columnTypeMod)
 {
-	Datum columnValue = 0;
+	ColumnValue columnValue = { false, 0 };
+	char *stringValue = NULL;
+	char *invalidChar = NULL;
 
 	switch(columnTypeId)
 	{
 		case INT2OID:
 		{
-			int16 value = (int16) bson_iterator_int(bsonIterator);
-			columnValue = Int16GetDatum(value);
+			long value;
+			if(BsonLong(bsonIterator, bsonType, &value)) {
+				columnValue.datum = Int16GetDatum((int16) value);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case INT4OID:
 		{
-			int32 value = bson_iterator_int(bsonIterator);
-			columnValue = Int32GetDatum(value);
+			long value;
+			if(BsonLong(bsonIterator, bsonType, &value)) {
+				columnValue.datum = Int32GetDatum((int32) value);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case INT8OID:
 		{
-			int64 value = bson_iterator_long(bsonIterator);
-			columnValue = Int64GetDatum(value);
+			long value;
+			if(BsonLong(bsonIterator, bsonType, &value)) {
+				columnValue.datum = Int64GetDatum((int64) value);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case FLOAT4OID:
 		{
-			float4 value = (float4) bson_iterator_double(bsonIterator);
-			columnValue = Float4GetDatum(value);
+			double value;
+			if(BsonDouble(bsonIterator, bsonType, &value)) {
+				columnValue.datum = Float4GetDatum((float4) value);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case FLOAT8OID:
 		{
-			float8 value = bson_iterator_double(bsonIterator);
-			columnValue = Float8GetDatum(value);
+			double value;
+			if(BsonDouble(bsonIterator, bsonType, &value)) {
+				columnValue.datum = Float8GetDatum((float8) value);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case NUMERICOID:
 		{
-			float8 value = bson_iterator_double(bsonIterator);
-			Datum valueDatum = Float8GetDatum(value);
-
-			/* overlook type modifiers for numeric */
-			columnValue = DirectFunctionCall1(float8_numeric, valueDatum);
+			double value;
+			if(BsonDouble(bsonIterator, bsonType, &value)) {
+				Datum datum = Float8GetDatum((float8) value);
+				/* overlook type modifiers for numeric */
+				columnValue.datum = DirectFunctionCall1(float8_numeric, datum);
+			}
+			else
+			{
+				columnValue.isNull = true;
+			}
 			break;
 		}
 		case BOOLOID:
 		{
-			bool value = bson_iterator_bool(bsonIterator);
-			columnValue = BoolGetDatum(value);
+			switch(bsonType)
+			{
+				case BSON_BOOL:
+				case BSON_INT:
+				case BSON_LONG:
+				case BSON_DOUBLE:
+				{
+					bool value = bson_iterator_bool(bsonIterator);
+					columnValue.datum = BoolGetDatum(value);
+					break;
+				}
+				case BSON_STRING:
+				{
+					char *stringValue = bson_iterator_string(bsonIterator);
+					int i = 0;
+					while(stringValue[i] != '\0') {
+						stringValue[i] = tolower(stringValue[i]);
+						i++;
+					}
+					if(!stringValue[0] || strcmp(stringValue, "f") == 0 ||
+						strcmp(stringValue, "false") == 0)
+					{
+						columnValue.datum = BoolGetDatum(false);
+					}
+					else if(strcmp(stringValue, "t") == 0 ||
+							strcmp(stringValue, "true") == 0)
+					{
+						columnValue.datum = BoolGetDatum(true);
+					}
+					else
+					{
+						columnValue.isNull = true;
+					}
+					break;
+				}
+			}
 			break;
 		}
 		case BPCHAROID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
+			const char *value = BsonString(bsonIterator, bsonType);
 			Datum valueDatum = CStringGetDatum(value);
 
-			columnValue = DirectFunctionCall3(bpcharin, valueDatum,
-											  ObjectIdGetDatum(InvalidOid),
-											  Int32GetDatum(columnTypeMod));
+			columnValue.datum = DirectFunctionCall3(bpcharin, valueDatum,
+													ObjectIdGetDatum(InvalidOid),
+													Int32GetDatum(columnTypeMod));
 			break;
 		}
 		case VARCHAROID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
+			const char *value = BsonString(bsonIterator, bsonType);
 			Datum valueDatum = CStringGetDatum(value);
 
-			columnValue = DirectFunctionCall3(varcharin, valueDatum,
-											  ObjectIdGetDatum(InvalidOid),
-											  Int32GetDatum(columnTypeMod));
+			columnValue.datum = DirectFunctionCall3(varcharin, valueDatum,
+													ObjectIdGetDatum(InvalidOid),
+													Int32GetDatum(columnTypeMod));
 			break;
 		}
 		case TEXTOID:
 		{
-			const char *value = bson_iterator_string(bsonIterator);
-			columnValue = CStringGetTextDatum(value);
+			const char *value = BsonString(bsonIterator, bsonType);
+			columnValue.datum = CStringGetTextDatum(value);
 			break;
 		}
     	case NAMEOID:
@@ -1340,9 +1594,9 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 			bson_oid_to_string(bsonObjectId, value);
 
 			valueDatum = CStringGetDatum(value);
-			columnValue = DirectFunctionCall3(namein, valueDatum,
-											  ObjectIdGetDatum(InvalidOid),
-											  Int32GetDatum(columnTypeMod));
+			columnValue.datum = DirectFunctionCall3(namein, valueDatum,
+													ObjectIdGetDatum(InvalidOid),
+													Int32GetDatum(columnTypeMod));
 			break;
 		}
 		case DATEOID:
@@ -1361,6 +1615,16 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
 					break;
 				}
+				case BSON_LONG:
+				{
+					valueMillis = bson_iterator_long(bsonIterator) * 1000L;
+					break;
+				}
+				case BSON_DOUBLE:
+				{
+					valueMillis = bson_iterator_double(bsonIterator) * 1000L;
+					break;
+				}
 				default:
 				{
 					ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
@@ -1373,7 +1637,7 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
-			columnValue = DirectFunctionCall1(timestamp_date, timestampDatum);
+			columnValue.datum = DirectFunctionCall1(timestamp_date, timestampDatum);
 			break;
 		}
 		case TIMESTAMPOID:
@@ -1393,6 +1657,16 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
 					break;
 				}
+				case BSON_LONG:
+				{
+					valueMillis = bson_iterator_long(bsonIterator) * 1000L;
+					break;
+				}
+				case BSON_DOUBLE:
+				{
+					valueMillis = bson_iterator_double(bsonIterator) * 1000L;
+					break;
+				}
 				default:
 				{
 					ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
@@ -1405,7 +1679,7 @@ ColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTyp
 			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 
 			/* overlook type modifiers for timestamp */
-			columnValue = TimestampGetDatum(timestamp);
+			columnValue.datum = TimestampGetDatum(timestamp);
 			break;
 		}
 		default:

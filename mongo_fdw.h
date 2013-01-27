@@ -136,6 +136,13 @@ typedef struct ColumnMapping
 } ColumnMapping;
 
 
+typedef struct ColumnValue
+{
+	bool isNull;
+	Datum datum;
+} ColumnValue;
+
+
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
 extern bson * QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions);
