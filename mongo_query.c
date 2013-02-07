@@ -208,7 +208,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
-		if (mongoFdwOptions->fieldName != NULL) {
+		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
 			if (strncmp(columnName, prefix, prefix_len) == 0)
 			{
 				columnName = columnName + prefix_len; 
@@ -264,7 +264,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
-		if (mongoFdwOptions->fieldName != NULL) {
+		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
 			if (strncmp(columnName, prefix, prefix_len) == 0)
 			{
 				columnName = columnName + prefix_len; 

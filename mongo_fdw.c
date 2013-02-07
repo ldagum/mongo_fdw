@@ -487,7 +487,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 		/* Now we have a document from the collection */
 
 		char *arrayFieldName = executionState->arrayFieldName;
-		if(!arrayFieldName)
+		if(!arrayFieldName || *arrayFieldName == '\0')
 		{
 			ereport(DEBUG2, (errmsg_internal("Filling tuple from collection document.")));
 			/* We're not iterating over any embedded arrays, so just fill the slot and return */
@@ -1178,7 +1178,8 @@ ColumnTypesCompatible(bson_type bsonType, Oid columnTypeId)
 		case TIMESTAMPTZOID:
 		{
 			if (bsonType == BSON_DATE || bsonType == BSON_OID ||
-				bsonType == BSON_LONG || bsonType == BSON_DOUBLE)
+				bsonType == BSON_INT || bsonType == BSON_LONG ||
+				bsonType == BSON_DOUBLE)
 			{
 				compatibleTypes = true;
 			}
@@ -1615,6 +1616,11 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
 					break;
 				}
+				case BSON_INT:
+				{
+					valueMillis = bson_iterator_long(bsonIterator) * 1000L;
+					break;
+				}
 				case BSON_LONG:
 				{
 					valueMillis = bson_iterator_long(bsonIterator) * 1000L;
@@ -1655,6 +1661,11 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 				{
 					bson_oid_t *oid = bson_iterator_oid(bsonIterator);
 					valueMillis = ((int32) bson_oid_generated_time(oid)) * 1000L;
+					break;
+				}
+				case BSON_INT:
+				{
+					valueMillis = bson_iterator_long(bsonIterator) * 1000L;
 					break;
 				}
 				case BSON_LONG:
