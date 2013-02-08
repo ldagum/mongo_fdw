@@ -24,6 +24,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
@@ -166,7 +167,8 @@ FindArgumentOfType(List *argumentList, NodeTag argumentType)
  * "l_shipdate: { $gte: new Date(757382400000), $lt: new Date(788918400000) }".
  */
 bson *
-QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions)
+QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions,
+		      struct HTAB *columnMappingHash)
 {
 	List *equalityOperatorList = NIL;
 	List *comparisonOperatorList = NIL;
@@ -201,6 +203,8 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		int columnNameLen = 0;
 		char *dot = NULL;
 		bson_type toBsonType = -1;
+		bool handleFound = false;
+		ColumnMapping *columnMapping = NULL;
 
 		List *argumentList = equalityOperator->args;
 		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
@@ -208,6 +212,10 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
+		void *hashKey = (void *) columnName;
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  hashKey, HASH_FIND,
+													  &handleFound);
 		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
 			if (strncmp(columnName, prefix, prefix_len) == 0)
 			{
@@ -221,7 +229,6 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 				columnName = columnNameInfo->data;
 			}
 		}
-		ereport(INFO, (errmsg_internal("Column name: %s", columnName)));
 
 		columnNameLen = strlen(columnName);
 		if (columnNameLen > suffixLen &&
@@ -231,6 +238,10 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 			/* Chop .generated off of the keyname to get the oid name */
 			*dot = '\0';
 			toBsonType = BSON_OID;
+		}
+		else if(columnMapping)
+		{
+			toBsonType = columnMapping->columnBsonType;
 		}
 
 		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
@@ -261,9 +272,15 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		int columnNameLen = 0;
 		char *dot = NULL;
 		bson_type toBsonType = -1;
+		ColumnMapping *columnMapping = NULL;
+		bool handleFound = false;
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
+		void *hashKey = (void *) columnName;
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  hashKey, HASH_FIND,
+													  &handleFound);
 		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
 			if (strncmp(columnName, prefix, prefix_len) == 0)
 			{
@@ -286,6 +303,10 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 			/* Chop .generated off of the keyname to get the oid name */
 			*dot = '\0';
 			toBsonType = BSON_OID;
+		}
+		else if(columnMapping)
+		{
+			toBsonType = columnMapping->columnBsonType;
 		}
 
 		/* find all expressions that correspond to the column */
@@ -433,6 +454,197 @@ ColumnOperatorList(Var *column, List *operatorList)
 	return columnOperatorList;
 }
 
+static bool
+AppendBsonInt(bson *queryDocument, const char *keyName,
+			  const bson_type toBsonType, int value)
+{
+	bool appended = false;
+	switch(toBsonType)
+	{
+		case BSON_STRING:
+		{
+			char *result = palloc0(22 * sizeof(char));
+			snprintf(result, 22, "%d", value);
+			bson_append_string(queryDocument, keyName, result);
+			appended = true;
+			break;
+		}
+		case BSON_DATE:
+		{
+			bson_append_date(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		default:
+		{
+			bson_append_int(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+	}
+	return appended;
+}
+
+static bool
+AppendBsonLong(bson *queryDocument, const char *keyName,
+			  const bson_type toBsonType, long value)
+{
+	bool appended = false;
+	switch(toBsonType)
+	{
+		case BSON_STRING:
+		{
+			char *result = palloc0(22 * sizeof(char));
+			snprintf(result, 22, "%ld", value);
+			bson_append_string(queryDocument, keyName, result);
+			appended = true;
+			break;
+		}
+		case BSON_DATE:
+		{
+			bson_append_date(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		default:
+		{
+			bson_append_long(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+	}
+	return appended;
+}
+
+static bool
+AppendBsonDouble(bson *queryDocument, const char *keyName,
+			  const bson_type toBsonType, double value)
+{
+	bool appended = false;
+	switch(toBsonType)
+	{
+		case BSON_STRING:
+		{
+			char *result = palloc0(22 * sizeof(char));
+			snprintf(result, 22, "%g", value);
+			bson_append_string(queryDocument, keyName, result);
+			appended = true;
+			break;
+		}
+		case BSON_DATE:
+		{
+			bson_append_date(queryDocument, keyName, (long) value);
+			appended = true;
+			break;
+		}
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		default:
+		{
+			bson_append_double(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+	}
+	return appended;
+}
+
+static bool
+AppendBsonString(bson *queryDocument, const char *keyName,
+			     const bson_type toBsonType, char *value)
+{
+	bool appended = false;
+	switch(toBsonType)
+	{
+		case BSON_INT:
+		case BSON_LONG:
+		{
+			long parsed = 0;
+			if(ParseLong(value, &parsed))
+			{
+				bson_append_long(queryDocument, keyName, parsed);
+				appended = true;
+			}
+			break;
+		}
+		case BSON_DOUBLE:
+		{
+			double parsed = 0.0;
+			if(ParseDouble(value, &parsed))
+			{
+				bson_append_double(queryDocument, keyName, parsed);
+				appended = true;
+			}
+			break;
+		}
+		case BSON_OID:
+		{
+			bson_oid_t bsonObjectId;
+			memset(bsonObjectId.bytes, 0, sizeof(bsonObjectId.bytes));
+			bson_oid_from_string(&bsonObjectId, value);
+			bson_append_oid(queryDocument, keyName, &bsonObjectId);
+			appended = true;
+			break;
+		}
+		case BSON_BOOL:
+		case BSON_STRING:
+		default:
+		{
+			bson_append_string(queryDocument, keyName, value);
+			appended = true;
+			break;
+		}
+	}
+	return appended;
+}
+
+static bool
+AppendBsonDate(bson *queryDocument, const char *keyName,
+			   const bson_type toBsonType, long valueMilliSecs)
+{
+	bool appended = false;
+	switch(toBsonType)
+	{
+		case BSON_INT:
+		case BSON_LONG:
+		case BSON_DOUBLE:
+		{
+			long valueSecs = valueMilliSecs / 1000;
+			ereport(INFO, (errmsg("Appending date as long %s: %ld", keyName, valueSecs)));
+			bson_append_long(queryDocument, keyName, valueSecs);
+			appended = true;
+			break;
+		}
+		case BSON_OID:
+		{
+			/* Generate an oid with a generated time at the time we're querying */
+			bson_oid_t oid;
+			time_t t = valueMilliSecs / 1000;
+			bson_big_endian32(&oid.ints[0], &t);
+			oid.ints[1] = 0;
+			oid.ints[2] = 0;
+			bson_append_oid(queryDocument, keyName, &oid);
+			appended = true;
+			break;
+		}
+		case BSON_DATE:
+		default:
+		{
+			ereport(INFO, (errmsg("Appending date as date %s: %ld", keyName, valueMilliSecs)));
+			bson_append_date(queryDocument, keyName, valueMilliSecs);
+			appended = true;
+			break;
+		}
+	}
+	return appended;
+}
 
 /*
  * AppendConstantValue appends to the query document the key name and constant
@@ -458,38 +670,38 @@ AppendConstantValue(bson *queryDocument, const char *keyName,
 		case INT2OID:
 		{
 			int16 value = DatumGetInt16(constantValue);
-			bson_append_int(queryDocument, keyName, (int) value);
+			AppendBsonInt(queryDocument, keyName, toBsonType, (int) value);
 			break;
 		}
 		case INT4OID:
 		{
 			int32 value = DatumGetInt32(constantValue);
-			bson_append_int(queryDocument, keyName, value);
+			AppendBsonInt(queryDocument, keyName, toBsonType, value);
 			break;
 		}
 		case INT8OID:
 		{
 			int64 value = DatumGetInt64(constantValue);
-			bson_append_long(queryDocument, keyName, value);
+			AppendBsonLong(queryDocument, keyName, toBsonType, value);
 			break;
 		}
 		case FLOAT4OID:
 		{
 			float4 value = DatumGetFloat4(constantValue);
-			bson_append_double(queryDocument, keyName, (double) value);
+			AppendBsonDouble(queryDocument, keyName, toBsonType, (double) value);
 			break;
 		}
 		case FLOAT8OID:
 		{
 			float8 value = DatumGetFloat8(constantValue);
-			bson_append_double(queryDocument, keyName, value);
+			AppendBsonDouble(queryDocument, keyName, toBsonType, value);
 			break;
 		}
 		case NUMERICOID:
 		{
 			Datum valueDatum = DirectFunctionCall1(numeric_float8, constantValue);
 			float8 value = DatumGetFloat8(valueDatum);
-			bson_append_double(queryDocument, keyName, value);
+			AppendBsonDouble(queryDocument, keyName, toBsonType, value);
 			break;
 		}
 		case BOOLOID:
@@ -509,7 +721,7 @@ AppendConstantValue(bson *queryDocument, const char *keyName,
 			getTypeOutputInfo(constantTypeId, &outputFunctionId, &typeVarLength);
 			outputString = OidOutputFunctionCall(outputFunctionId, constantValue);
 
-			bson_append_string(queryDocument, keyName, outputString);
+			AppendBsonString(queryDocument, keyName, toBsonType, outputString);
 			break;
 		}
 	    case NAMEOID:
@@ -533,20 +745,7 @@ AppendConstantValue(bson *queryDocument, const char *keyName,
 			Timestamp valueTimestamp = DatumGetTimestamp(valueDatum);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
-			if (toBsonType == BSON_OID)
-			{
-				/* Generate an oid with a generated time at the time we're querying */
-				bson_oid_t oid;
-				time_t t = valueMilliSecs / 1000;
-				bson_big_endian32(&oid.ints[0], &t);
-				oid.ints[1] = 0;
-				oid.ints[2] = 0;
-				bson_append_oid(queryDocument, keyName, &oid);
-			}
-			else
-			{
-				bson_append_date(queryDocument, keyName, valueMilliSecs);
-			}
+			AppendBsonDate(queryDocument, keyName, toBsonType, valueMilliSecs);
 			break;
 		}
 		case TIMESTAMPOID:
@@ -555,20 +754,7 @@ AppendConstantValue(bson *queryDocument, const char *keyName,
 			Timestamp valueTimestamp = DatumGetTimestamp(constantValue);
 			int64 valueMicroSecs = valueTimestamp + POSTGRES_TO_UNIX_EPOCH_USECS;
 			int64 valueMilliSecs = valueMicroSecs / 1000;
-			if (toBsonType == BSON_OID)
-			{
-				/* Generate an oid with a generated time at the time we're querying */
-				bson_oid_t oid;
-				time_t t = valueMilliSecs / 1000;
-				bson_big_endian32(&oid.ints[0], &t);
-				oid.ints[1] = 0;
-				oid.ints[2] = 0;
-				bson_append_oid(queryDocument, keyName, &oid);
-			}
-			else
-			{
-				bson_append_date(queryDocument, keyName, valueMilliSecs);
-			}
+			AppendBsonDate(queryDocument, keyName, toBsonType, valueMilliSecs);
 			break;
 		}
 		default:

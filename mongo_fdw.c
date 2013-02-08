@@ -221,6 +221,11 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 	double documentCount = 0.0;
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwPlanState *fdw_private;
+	HTAB *columnMappingHash;
+
+	/* we don't need to serialize column list as lists are copiable */
+	columnList = ColumnList(baserel);
+	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
 
 	/*
 	 * We construct the query document to have MongoDB filter its rows. We could
@@ -230,14 +235,12 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 	 */
 	mongoFdwOptions = MongoGetOptions(foreignTableId);
 	opExpressionList = ApplicableOpExpressionList(baserel);
-	queryDocument = QueryDocument(foreignTableId, opExpressionList, mongoFdwOptions);
+	queryDocument = QueryDocument(foreignTableId, opExpressionList, mongoFdwOptions,
+								  columnMappingHash);
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
 	bson_dispose(queryDocument);
-
-	/* we don't need to serialize column list as lists are copiable */
-	columnList = ColumnList(baserel);
 
 	/* construct foreign plan with query document and column list */
 	fdw_private = (MongoFdwPlanState *)palloc(sizeof(MongoFdwPlanState));
@@ -496,7 +499,7 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 }
 
 static bson_type 
-BsonFindSubobject(bson_iterator *bsonIterator, bson *bsonObject, const char* path)
+BsonFindSubobject(bson_iterator *bsonIterator, const bson *bsonObject, const char* path)
 {
 	bson_type bsonCursorStatus;
 	char *dot = strchr(path, '.');
@@ -540,7 +543,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	bson_iterator *arrayCursor = executionState->arrayCursor;
 	int32 mongoCursorStatus = MONGO_ERROR;
 	bson_type bsonCursorStatus;
-	bson *collectionDocument = executionState->parentDocument;
+	const bson *collectionDocument = executionState->parentDocument;
 
 	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	Datum *columnValues = tupleSlot->tts_values;
@@ -675,7 +678,6 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 static void
 MongoEndForeignScan(ForeignScanState *scanState)
 {
-	ForeignScan *foreignScan = NULL;
 	mongo_cursor *mongoCursor = NULL;
 
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
@@ -961,7 +963,7 @@ MongoGetOptions(Oid foreignTableId)
 	collectionName = MongoGetOptionValue(optionList, OPTION_NAME_COLLECTION);
 	if (collectionName == NULL)
 	{
-		collectionName = get_rel_name(optionList);
+		collectionName = get_rel_name(foreignTableId);
 	}
 	
 	fieldName = MongoGetOptionValue(optionList, OPTION_NAME_FIELD);
@@ -1022,6 +1024,62 @@ MongoGetOptionValue(List *optionList, const char *optionName)
 	return optionValue;
 }
 
+static void
+AddColumnOptions(ColumnMapping *columnMapping, Oid foreignTableId, AttrNumber columnId)
+{
+	List *options;
+	ListCell *lc;
+
+	options = GetForeignColumnOptions(foreignTableId, columnId);
+	foreach(lc, options)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, OPTION_NAME_MONGO_TYPE) == 0)
+		{
+			char *type = defGetString(def);
+			bson_type bsonType = 0;
+			if (pg_strcasecmp(type, "integer") == 0)
+			{
+				bsonType = BSON_INT;
+			}
+			else if (pg_strcasecmp(type, "long") == 0)
+			{
+				bsonType = BSON_LONG;
+			}
+			else if (pg_strcasecmp(type, "double") == 0)
+			{
+				bsonType = BSON_DOUBLE;
+			}
+			else if (pg_strcasecmp(type, "string") == 0)
+			{
+				bsonType = BSON_STRING;
+			}
+			else if (pg_strcasecmp(type, "oid") == 0)
+			{
+				bsonType = BSON_OID;
+			}
+			else if (pg_strcasecmp(type, "bool") == 0)
+			{
+				bsonType = BSON_BOOL;
+			}
+			else if (pg_strcasecmp(type, "date") == 0)
+			{
+				bsonType = BSON_DATE;
+			}
+			else if (pg_strcasecmp(type, "timestamp") == 0)
+			{
+				bsonType = BSON_TIMESTAMP;
+			}
+			else if (*type != '\0')
+			{
+				ereport(ERROR, (errmsg("Type %s is not a valid column mongo_type.", type)));
+			}
+
+			columnMapping->columnBsonType = bsonType;
+		}
+	}
+}
 
 /*
  * ColumnMappingHash creates a hash table that maps column names to column index
@@ -1068,6 +1126,7 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
 		columnMapping->columnTypeId = column->vartype;
 		columnMapping->columnTypeMod = column->vartypmod;
 		columnMapping->columnArrayTypeId = get_element_type(column->vartype);
+		AddColumnOptions(columnMapping, foreignTableId, columnId);
 	}
 
 	return columnMappingHash;
@@ -1370,52 +1429,6 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 	return columnValueDatum;
 }
 
-/*
- * ParseLong attempts to parse a number from value using strtol.
- * If the string is null, is empty, or has any characters that are not
- * valid for a base 10 number, the function returns false.
- */
-static bool
-ParseLong(const char *value, long *result)
-{
-	long temp;
-	char *invalidChar;
-	if(!*value)
-	{
-		return false;
-	}
-	temp = strtol(value, &invalidChar, 10);
-	if (*invalidChar)
-	{
-		return false;
-	}
-	*result = temp;
-	return true;
-}
-
-/*
- * ParseDOuble attempts to parse a number from value using strtod.
- * If the string is null, is empty, or has any characters that are not
- * valid for a base 10 number, the function returns false.
- */
-static bool
-ParseDouble(const char *value, double *result)
-{
-	double temp;
-	char *invalidChar;
-	if(!*value)
-	{
-		return false;
-	}
-	temp = strtod(value, &invalidChar);
-	if (*invalidChar)
-	{
-		return false;
-	}
-	*result = temp;
-	return true;
-}
-
 static bool
 BsonLong(bson_iterator *bsonIterator, const bson_type bsonType, long *result)
 {
@@ -1424,7 +1437,8 @@ BsonLong(bson_iterator *bsonIterator, const bson_type bsonType, long *result)
 		case BSON_STRING:
 		{
 			long value = 0;
-			if(ParseLong(bson_iterator_string(bsonIterator), &value)) {
+			if(ParseLong(bson_iterator_string(bsonIterator), &value))
+			{
 				*result = value;
 				return true;
 			}
@@ -1549,8 +1563,6 @@ static ColumnValue
 CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid columnTypeId, int32 columnTypeMod)
 {
 	ColumnValue columnValue = { false, 0 };
-	char *stringValue = NULL;
-	char *invalidChar = NULL;
 
 	switch(columnTypeId)
 	{
@@ -1643,18 +1655,13 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 				}
 				case BSON_STRING:
 				{
-					char *stringValue = bson_iterator_string(bsonIterator);
-					int i = 0;
-					while(stringValue[i] != '\0') {
-						stringValue[i] = tolower(stringValue[i]);
-						i++;
-					}
-					if(!stringValue[0] || strcmp(stringValue, "f") == 0 ||
+					const char *stringValue = bson_iterator_string(bsonIterator);
+					if(!stringValue[0] || pg_strcasecmp(stringValue, "f") == 0 ||
 						strcmp(stringValue, "false") == 0)
 					{
 						columnValue.datum = BoolGetDatum(false);
 					}
-					else if(strcmp(stringValue, "t") == 0 ||
+					else if(pg_strcasecmp(stringValue, "t") == 0 ||
 							strcmp(stringValue, "true") == 0)
 					{
 						columnValue.datum = BoolGetDatum(true);
@@ -1663,6 +1670,11 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 					{
 						columnValue.isNull = true;
 					}
+					break;
+				}
+				default:
+				{
+					columnValue.isNull = true;
 					break;
 				}
 			}

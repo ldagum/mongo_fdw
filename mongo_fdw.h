@@ -18,6 +18,7 @@
 #include "mongo.h"
 
 #include "fmgr.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
@@ -35,6 +36,7 @@
 #define OPTION_NAME_USERNAME "username"
 #define OPTION_NAME_PASSWORD "password"
 #define OPTION_NAME_USE_AUTH "use_auth"
+#define OPTION_NAME_MONGO_TYPE "mongo_type"
 
 /* Default values for option parameters */
 #define DEFAULT_IP_ADDRESS "127.0.0.1"
@@ -64,7 +66,7 @@ typedef struct MongoValidOption
 
 
 /* Array of options that are valid for mongo_fdw */
-static const uint32 ValidOptionCount = 8;
+static const uint32 ValidOptionCount = 9;
 static const MongoValidOption ValidOptionArray[] =
 {
 	/* foreign server options */
@@ -76,6 +78,8 @@ static const MongoValidOption ValidOptionArray[] =
 	{ OPTION_NAME_DATABASE, ForeignTableRelationId },
 	{ OPTION_NAME_COLLECTION, ForeignTableRelationId },
 	{ OPTION_NAME_FIELD, ForeignTableRelationId },
+
+	{ OPTION_NAME_MONGO_TYPE, AttributeRelationId },
 
 	  /* user mapping options */
 	{ OPTION_NAME_USERNAME, UserMappingRelationId },
@@ -111,7 +115,7 @@ typedef struct MongoFdwExecState
 	struct HTAB *columnMappingHash;
 	mongo *mongoConnection;
 	mongo_cursor *mongoCursor;
-	bson *parentDocument;
+	const bson *parentDocument;
 	char *arrayFieldName;
 	bson_iterator *arrayCursor;
 	bson *queryDocument;
@@ -132,6 +136,7 @@ typedef struct ColumnMapping
 	Oid columnTypeId;
 	int32 columnTypeMod;
 	Oid columnArrayTypeId;
+	bson_type columnBsonType;
 
 } ColumnMapping;
 
@@ -145,12 +150,61 @@ typedef struct ColumnValue
 
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
-extern bson * QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions);
+extern bson * QueryDocument(Oid relationId, List *opExpressionList,
+							MongoFdwOptions* mongoFdwOptions,
+							struct HTAB *columnMappingHash);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */
 extern Datum mongo_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum mongo_fdw_validator(PG_FUNCTION_ARGS);
+
+
+/*
+ * ParseLong attempts to parse a number from value using strtol.
+ * If the string is null, is empty, or has any characters that are not
+ * valid for a base 10 number, the function returns false.
+ */
+static bool
+ParseLong(const char *value, long *result)
+{
+	long temp;
+	char *invalidChar;
+	if(!*value)
+	{
+		return false;
+	}
+	temp = strtol(value, &invalidChar, 10);
+	if (*invalidChar)
+	{
+		return false;
+	}
+	*result = temp;
+	return true;
+}
+
+/*
+ * ParseDOuble attempts to parse a number from value using strtod.
+ * If the string is null, is empty, or has any characters that are not
+ * valid for a base 10 number, the function returns false.
+ */
+static bool
+ParseDouble(const char *value, double *result)
+{
+	double temp;
+	char *invalidChar;
+	if(!*value)
+	{
+		return false;
+	}
+	temp = strtod(value, &invalidChar);
+	if (*invalidChar)
+	{
+		return false;
+	}
+	*result = temp;
+	return true;
+}
 
 
 #endif   /* MONGO_FDW_H */
