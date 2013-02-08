@@ -1,2 +1,7 @@
 *.o
+<<<<<<< HEAD
 *.so
+=======
+mongo_fdw.so
+
+>>>>>>> matheus/master
