@@ -1246,7 +1246,7 @@ FillTupleSlotColumn(const ColumnMapping *columnMapping,
 	{
 		compatibleTypes = true;
 	}
-	else
+	else if(!OidIsValid(columnArrayTypeId))
 	{
 		compatibleTypes = ColumnTypesCompatible(bsonType, columnTypeId);
 	}
