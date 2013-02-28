@@ -150,6 +150,9 @@ typedef struct ColumnValue
 
 /* Function declarations related to creating the mongo query */
 extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
+extern List * SelectColumnList(RelOptInfo *baserel);
+extern bson * FieldsDocument(Oid relationId, List *selectColumnList,
+							 MongoFdwOptions* mongoFdwOptions);
 extern bson * QueryDocument(Oid relationId, List *opExpressionList,
 							MongoFdwOptions* mongoFdwOptions,
 							struct HTAB *columnMappingHash);

@@ -42,6 +42,7 @@
  */
 typedef struct MongoFdwPlanState {
 	Const *queryBuffer;
+	Const *fieldsBuffer;
 	List *columnList;
 	double outputRowCount;
 	Cost startupCost;
@@ -217,7 +218,10 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 	List *opExpressionList = NIL;
 	bson *queryDocument = NULL;
 	Const *queryBuffer = NULL;
+	bson *fieldsDocument = NULL;
+	Const *fieldsBuffer = NULL;
 	List *columnList = NIL;
+	List *selectColumnList = NIL;
 	double documentCount = 0.0;
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwPlanState *fdw_private;
@@ -239,12 +243,17 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 								  columnMappingHash);
 	queryBuffer = SerializeDocument(queryDocument);
 
+	selectColumnList = SelectColumnList(baserel);
+	fieldsDocument = FieldsDocument(foreignTableId, selectColumnList, mongoFdwOptions);
+	fieldsBuffer = SerializeDocument(fieldsDocument);
+
 	/* only clean up the query struct, but not its data */
 	bson_dispose(queryDocument);
 
 	/* construct foreign plan with query document and column list */
 	fdw_private = (MongoFdwPlanState *)palloc(sizeof(MongoFdwPlanState));
 	fdw_private->queryBuffer = queryBuffer;
+	fdw_private->fieldsBuffer = fieldsBuffer;
 	fdw_private->columnList = columnList;
 
 	/*
@@ -408,7 +417,9 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	ForeignScan *foreignScan = NULL;
 	MongoFdwPlanState *fdw_private = NULL;
 	Const *queryBuffer = NULL;
+	Const *fieldsBuffer = NULL;
 	bson *queryDocument = NULL;
+	bson *fieldsDocument = NULL;
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwExecState *executionState = NULL;
 
@@ -472,6 +483,9 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	queryBuffer = fdw_private->queryBuffer;
 	queryDocument = DeserializeDocument(queryBuffer);
 
+	fieldsBuffer = fdw_private->fieldsBuffer;
+	fieldsDocument = DeserializeDocument(fieldsBuffer);
+
 	columnList = fdw_private->columnList;
 	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
 
@@ -483,6 +497,7 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	mongoCursor = mongo_cursor_create();
 	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
 	mongo_cursor_set_options(mongoCursor, MONGO_SLAVE_OK);
+	mongo_cursor_set_fields(mongoCursor, fieldsDocument);
 	mongo_cursor_set_query(mongoCursor, queryDocument);
 
 	/* create and set foreign execution state */

@@ -39,6 +39,7 @@ static List * ColumnOperatorList(Var *column, List *operatorList);
 static void AppendConstantValue(bson *queryDocument, const char *keyName,
 								const bson_type toBsonType, Const *constant);
 
+static const char * GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions);
 
 /*
  * ApplicableOpExpressionList walks over all filter clauses that relate to this
@@ -156,6 +157,78 @@ FindArgumentOfType(List *argumentList, NodeTag argumentType)
 
 	return foundArgument;
 }
+
+
+List *
+SelectColumnList(RelOptInfo *baserel)
+{
+	List	   *attr_used = NIL;
+	if (baserel->baserestrictinfo != NIL)
+	{
+		ListCell *lc;
+		foreach (lc, baserel->baserestrictinfo)
+		{
+			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+			List *attrs;
+
+			attrs = pull_var_clause((Node *) ri->clause,
+									PVC_RECURSE_AGGREGATES,
+									PVC_RECURSE_PLACEHOLDERS);
+			attr_used = list_union(attr_used, attrs);
+		}
+	}
+
+	attr_used = list_union(attr_used, baserel->reltargetlist);
+	return attr_used;
+}
+
+
+bson *
+FieldsDocument(Oid relationId, List *selectColumnList, MongoFdwOptions *mongoFdwOptions)
+{
+	const char *colname = NULL;
+	bson *document = NULL;
+	ListCell *lc = NULL;
+	Var *var = NULL;
+
+	document = bson_create();
+	bson_init(document);
+
+	foreach (lc, selectColumnList)
+	{
+		var = lfirst(lc);
+		colname = get_attname(relationId, var->varattno);
+		colname = GetMongoColumnName(colname, mongoFdwOptions);
+		bson_append_int(document, colname, 1);
+	}
+
+	return document;
+}
+
+const char *
+GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions)
+{
+	char *prefix = "parent.";
+	int prefix_len = strlen(prefix);
+	const char *mongoColumnName = pgColumnName;
+	StringInfo columnNameInfo = NULL;
+
+	if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
+		if (strncmp(pgColumnName, prefix, prefix_len) == 0)
+		{
+			mongoColumnName = pgColumnName + prefix_len; 
+		}
+		else
+		{
+			columnNameInfo = makeStringInfo();
+			appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+							 pgColumnName);
+			mongoColumnName = columnNameInfo->data;
+		}
+	}
+	return mongoColumnName;
+}
+	
 
 
 /*
