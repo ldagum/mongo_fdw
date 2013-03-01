@@ -483,8 +483,11 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	queryBuffer = fdw_private->queryBuffer;
 	queryDocument = DeserializeDocument(queryBuffer);
 
-	fieldsBuffer = fdw_private->fieldsBuffer;
-	fieldsDocument = DeserializeDocument(fieldsBuffer);
+	if (mongoFdwOptions->pushFields)
+	{
+		fieldsBuffer = fdw_private->fieldsBuffer;
+		fieldsDocument = DeserializeDocument(fieldsBuffer);
+	}
 
 	columnList = fdw_private->columnList;
 	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
@@ -497,7 +500,10 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	mongoCursor = mongo_cursor_create();
 	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
 	mongo_cursor_set_options(mongoCursor, MONGO_SLAVE_OK);
-	mongo_cursor_set_fields(mongoCursor, fieldsDocument);
+	if (mongoFdwOptions->pushFields)
+	{
+		mongo_cursor_set_fields(mongoCursor, fieldsDocument);
+	}
 	mongo_cursor_set_query(mongoCursor, queryDocument);
 
 	/* create and set foreign execution state */
@@ -941,6 +947,8 @@ MongoGetOptions(Oid foreignTableId)
 	char *password = NULL;
 	char *useAuthStr = NULL;
 	bool useAuth = false;
+	char *pushFieldsStr = NULL;
+	bool pushFields = false;
 
 	ForeignTable *foreignTable = NULL;
 	ForeignServer *foreignServer = NULL;
@@ -999,6 +1007,15 @@ MongoGetOptions(Oid foreignTableId)
 		password = MongoGetOptionValue(optionList, OPTION_NAME_PASSWORD);
 	}
 
+	pushFieldsStr = MongoGetOptionValue(optionList, OPTION_NAME_PUSH_FIELDS);
+	if (pushFieldsStr != NULL)
+	{
+		if (!parse_bool(pushFieldsStr, &pushFields))
+		{
+			pushFields = false;
+		}
+	}
+
 	mongoFdwOptions = (MongoFdwOptions *) palloc0(sizeof(MongoFdwOptions));
 	mongoFdwOptions->addressName = addressName;
 	mongoFdwOptions->portNumber = portNumber;
@@ -1008,6 +1025,7 @@ MongoGetOptions(Oid foreignTableId)
 	mongoFdwOptions->username = username;
 	mongoFdwOptions->password = password;
 	mongoFdwOptions->useAuth = useAuth;
+	mongoFdwOptions->pushFields = pushFields;
 
 	return mongoFdwOptions;
 }

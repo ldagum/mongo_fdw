@@ -37,6 +37,7 @@
 #define OPTION_NAME_PASSWORD "password"
 #define OPTION_NAME_USE_AUTH "use_auth"
 #define OPTION_NAME_MONGO_TYPE "mongo_type"
+#define OPTION_NAME_PUSH_FIELDS "push_fields"
 
 /* Default values for option parameters */
 #define DEFAULT_IP_ADDRESS "127.0.0.1"
@@ -51,6 +52,9 @@
 #define POSTGRES_TO_UNIX_EPOCH_DAYS (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE)
 #define POSTGRES_TO_UNIX_EPOCH_USECS (POSTGRES_TO_UNIX_EPOCH_DAYS * USECS_PER_DAY)
 
+/* Defines for conventions for composing column names */
+#define OID_GENERATED_SUFFIX ".generated"
+#define PARENT_PREFIX "parent."
 
 /*
  * MongoValidOption keeps an option name and a context. When an option is passed
@@ -66,7 +70,7 @@ typedef struct MongoValidOption
 
 
 /* Array of options that are valid for mongo_fdw */
-static const uint32 ValidOptionCount = 9;
+static const uint32 ValidOptionCount = 10;
 static const MongoValidOption ValidOptionArray[] =
 {
 	/* foreign server options */
@@ -78,10 +82,12 @@ static const MongoValidOption ValidOptionArray[] =
 	{ OPTION_NAME_DATABASE, ForeignTableRelationId },
 	{ OPTION_NAME_COLLECTION, ForeignTableRelationId },
 	{ OPTION_NAME_FIELD, ForeignTableRelationId },
+	{ OPTION_NAME_PUSH_FIELDS, ForeignTableRelationId },
 
+	/* foreign column options */
 	{ OPTION_NAME_MONGO_TYPE, AttributeRelationId },
 
-	  /* user mapping options */
+	/* user mapping options */
 	{ OPTION_NAME_USERNAME, UserMappingRelationId },
 	{ OPTION_NAME_PASSWORD, UserMappingRelationId }
 };
@@ -102,6 +108,7 @@ typedef struct MongoFdwOptions
 	char *username;
 	char *password;
 	bool useAuth;
+	bool pushFields;
 
 } MongoFdwOptions;
 

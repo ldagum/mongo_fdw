@@ -208,15 +208,16 @@ FieldsDocument(Oid relationId, List *selectColumnList, MongoFdwOptions *mongoFdw
 const char *
 GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions)
 {
-	char *prefix = "parent.";
-	int prefix_len = strlen(prefix);
+	int prefixLen = strlen(PARENT_PREFIX);
+	int suffixLen = strlen(OID_GENERATED_SUFFIX);
+	int columnNameLen = 0;
 	const char *mongoColumnName = pgColumnName;
 	StringInfo columnNameInfo = NULL;
 
 	if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
-		if (strncmp(pgColumnName, prefix, prefix_len) == 0)
+		if (strncmp(pgColumnName, PARENT_PREFIX, prefixLen) == 0)
 		{
-			mongoColumnName = pgColumnName + prefix_len; 
+			mongoColumnName = pgColumnName + prefixLen; 
 		}
 		else
 		{
@@ -225,6 +226,20 @@ GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions)
 							 pgColumnName);
 			mongoColumnName = columnNameInfo->data;
 		}
+	}
+	columnNameLen = strlen(mongoColumnName);
+	if (columnNameLen > suffixLen &&
+		strcmp(mongoColumnName + (columnNameLen - suffixLen), OID_GENERATED_SUFFIX) == 0)
+	{
+		char *copy = palloc((columnNameLen - suffixLen + 1));
+		char *i = copy;
+		const char *end = mongoColumnName + (columnNameLen - suffixLen);
+		while (mongoColumnName != end)
+		{
+			*i++ = *mongoColumnName++;
+		}
+		*i = '\n';
+		mongoColumnName = copy;
 	}
 	return mongoColumnName;
 }
@@ -250,9 +265,8 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 	ListCell *columnCell = NULL;
 	bson *queryDocument = NULL;
 	int documentStatus = BSON_OK;
-	char *prefix = "parent.";
-	char *oidGeneratedKeySuffix = ".generated";
-	int prefix_len = strlen(prefix);
+	int suffixLen = strlen(OID_GENERATED_SUFFIX);
+	int prefix_len = strlen(PARENT_PREFIX);
 	StringInfo columnNameInfo = NULL;
 
 	queryDocument = bson_create();
@@ -272,7 +286,6 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		OpExpr *equalityOperator = (OpExpr *) lfirst(equalityOperatorCell);
 		Oid columnId = InvalidOid;
 		char *columnName = NULL;
-		int suffixLen = strlen(oidGeneratedKeySuffix);
 		int columnNameLen = 0;
 		char *dot = NULL;
 		bson_type toBsonType = -1;
@@ -290,7 +303,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 													  hashKey, HASH_FIND,
 													  &handleFound);
 		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
-			if (strncmp(columnName, prefix, prefix_len) == 0)
+			if (strncmp(columnName, PARENT_PREFIX, prefix_len) == 0)
 			{
 				columnName = columnName + prefix_len; 
 			}
@@ -305,7 +318,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		columnNameLen = strlen(columnName);
 		if (columnNameLen > suffixLen &&
-			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+			strcmp(columnName + (columnNameLen - suffixLen), OID_GENERATED_SUFFIX) == 0)
 		{
 			dot = columnName + (columnNameLen - suffixLen);
 			/* Chop .generated off of the keyname to get the oid name */
@@ -341,7 +354,6 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		char *columnName = NULL;
 		List *columnOperatorList = NIL;
 		ListCell *columnOperatorCell = NULL;
-		int suffixLen = strlen(oidGeneratedKeySuffix);
 		int columnNameLen = 0;
 		char *dot = NULL;
 		bson_type toBsonType = -1;
@@ -355,7 +367,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 													  hashKey, HASH_FIND,
 													  &handleFound);
 		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
-			if (strncmp(columnName, prefix, prefix_len) == 0)
+			if (strncmp(columnName, PARENT_PREFIX, prefix_len) == 0)
 			{
 				columnName = columnName + prefix_len; 
 			}
@@ -370,7 +382,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		columnNameLen = strlen(columnName);
 		if (columnNameLen > suffixLen &&
-			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+			strcmp(columnName + (columnNameLen - suffixLen), OID_GENERATED_SUFFIX) == 0)
 		{
 			dot = columnName + (columnNameLen - suffixLen);
 			/* Chop .generated off of the keyname to get the oid name */
