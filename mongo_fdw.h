@@ -126,6 +126,8 @@ typedef struct MongoFdwExecState
 	char *arrayFieldName;
 	bson_iterator *arrayCursor;
 	bson *queryDocument;
+	bool pushFields;
+	bson *fieldsDocument;
 
 } MongoFdwExecState;
 

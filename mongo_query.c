@@ -201,6 +201,7 @@ FieldsDocument(Oid relationId, List *selectColumnList, MongoFdwOptions *mongoFdw
 		colname = GetMongoColumnName(colname, mongoFdwOptions);
 		bson_append_int(document, colname, 1);
 	}
+	bson_finish(document);
 
 	return document;
 }
@@ -231,7 +232,7 @@ GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions)
 	if (columnNameLen > suffixLen &&
 		strcmp(mongoColumnName + (columnNameLen - suffixLen), OID_GENERATED_SUFFIX) == 0)
 	{
-		char *copy = palloc((columnNameLen - suffixLen + 1));
+		char *copy = palloc(columnNameLen - suffixLen + 1);
 		char *i = copy;
 		const char *end = mongoColumnName + (columnNameLen - suffixLen);
 		while (mongoColumnName != end)

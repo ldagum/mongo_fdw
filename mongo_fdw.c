@@ -249,6 +249,7 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 
 	/* only clean up the query struct, but not its data */
 	bson_dispose(queryDocument);
+	bson_dispose(fieldsDocument);
 
 	/* construct foreign plan with query document and column list */
 	fdw_private = (MongoFdwPlanState *)palloc(sizeof(MongoFdwPlanState));
@@ -515,6 +516,8 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	executionState->arrayCursor = NULL;
 	executionState->arrayFieldName = mongoFdwOptions->fieldName;
 	executionState->queryDocument = queryDocument;
+	executionState->pushFields = mongoFdwOptions->pushFields;
+	executionState->fieldsDocument = fieldsDocument;
 
 	scanState->fdw_state = (void *) executionState;
 }
@@ -756,6 +759,10 @@ MongoReScanForeignScan(ForeignScanState *scanState)
 	/* reconstruct cursor for collection name and set query */
 	mongoCursor = mongo_cursor_create();
 	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
+	if (executionState->pushFields)
+	{
+		mongo_cursor_set_fields(mongoCursor, executionState->fieldsDocument);
+	}
 	mongo_cursor_set_query(mongoCursor, executionState->queryDocument);
 
 	executionState->mongoCursor = mongoCursor;
@@ -1873,6 +1880,9 @@ MongoFreeScanState(MongoFdwExecState *executionState)
 
 	bson_destroy(executionState->queryDocument);
 	bson_dispose(executionState->queryDocument);
+
+	bson_destroy(executionState->fieldsDocument);
+	bson_dispose(executionState->fieldsDocument);
 
 	mongo_cursor_destroy(executionState->mongoCursor);
 	mongo_cursor_dispose(executionState->mongoCursor);
