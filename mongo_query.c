@@ -239,7 +239,7 @@ GetMongoColumnName(const char * pgColumnName, MongoFdwOptions *mongoFdwOptions)
 		{
 			*i++ = *mongoColumnName++;
 		}
-		*i = '\n';
+		*i = '\0';
 		mongoColumnName = copy;
 	}
 	return mongoColumnName;
