@@ -484,11 +484,8 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	queryBuffer = fdw_private->queryBuffer;
 	queryDocument = DeserializeDocument(queryBuffer);
 
-	if (mongoFdwOptions->pushFields)
-	{
-		fieldsBuffer = fdw_private->fieldsBuffer;
-		fieldsDocument = DeserializeDocument(fieldsBuffer);
-	}
+	fieldsBuffer = fdw_private->fieldsBuffer;
+	fieldsDocument = DeserializeDocument(fieldsBuffer);
 
 	columnList = fdw_private->columnList;
 	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
@@ -501,10 +498,7 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	mongoCursor = mongo_cursor_create();
 	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
 	mongo_cursor_set_options(mongoCursor, MONGO_SLAVE_OK);
-	if (mongoFdwOptions->pushFields)
-	{
-		mongo_cursor_set_fields(mongoCursor, fieldsDocument);
-	}
+	mongo_cursor_set_fields(mongoCursor, fieldsDocument);
 	mongo_cursor_set_query(mongoCursor, queryDocument);
 
 	/* create and set foreign execution state */
@@ -759,10 +753,7 @@ MongoReScanForeignScan(ForeignScanState *scanState)
 	/* reconstruct cursor for collection name and set query */
 	mongoCursor = mongo_cursor_create();
 	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
-	if (executionState->pushFields)
-	{
-		mongo_cursor_set_fields(mongoCursor, executionState->fieldsDocument);
-	}
+	mongo_cursor_set_fields(mongoCursor, executionState->fieldsDocument);
 	mongo_cursor_set_query(mongoCursor, executionState->queryDocument);
 
 	executionState->mongoCursor = mongoCursor;
