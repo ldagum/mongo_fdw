@@ -33,6 +33,7 @@
 #define OPTION_NAME_DATABASE "database"
 #define OPTION_NAME_COLLECTION "collection"
 #define OPTION_NAME_FIELD "field"
+#define OPTION_NAME_UNWIND_FIELD "unwind_field"
 #define OPTION_NAME_USERNAME "username"
 #define OPTION_NAME_PASSWORD "password"
 #define OPTION_NAME_USE_AUTH "use_auth"
@@ -66,7 +67,7 @@ typedef struct MongoValidOption
 
 
 /* Array of options that are valid for mongo_fdw */
-static const uint32 ValidOptionCount = 9;
+static const uint32 ValidOptionCount = 10;
 static const MongoValidOption ValidOptionArray[] =
 {
 	/* foreign server options */
@@ -78,6 +79,7 @@ static const MongoValidOption ValidOptionArray[] =
 	{ OPTION_NAME_DATABASE, ForeignTableRelationId },
 	{ OPTION_NAME_COLLECTION, ForeignTableRelationId },
 	{ OPTION_NAME_FIELD, ForeignTableRelationId },
+	{ OPTION_NAME_UNWIND_FIELD, ForeignTableRelationId },
 
 	{ OPTION_NAME_MONGO_TYPE, AttributeRelationId },
 
@@ -99,6 +101,7 @@ typedef struct MongoFdwOptions
 	char *databaseName;
 	char *collectionName;
 	char *fieldName;
+	char *unwindFieldName;
 	char *username;
 	char *password;
 	bool useAuth;
@@ -118,8 +121,8 @@ typedef struct MongoFdwExecState
 	const bson *parentDocument;
 	char *arrayFieldName;
 	bson_iterator *arrayCursor;
+	bson_iterator *arrayCursor2;
 	bson *queryDocument;
-
 } MongoFdwExecState;
 
 
@@ -153,6 +156,9 @@ extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
 extern bson * QueryDocument(Oid relationId, List *opExpressionList,
 							MongoFdwOptions* mongoFdwOptions,
 							struct HTAB *columnMappingHash);
+extern bson * CommandQueryDocument(Oid relationId, List *opExpressionList,
+								   MongoFdwOptions* mongoFdwOptions,
+								   struct HTAB *columnMappingHash);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */
