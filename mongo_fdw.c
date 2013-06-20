@@ -66,6 +66,10 @@ static void MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags
 static TupleTableSlot * MongoIterateForeignScan(ForeignScanState *scanState);
 static void MongoEndForeignScan(ForeignScanState *scanState);
 static void MongoReScanForeignScan(ForeignScanState *scanState);
+static bson *MongoIterateForeignScanArrayHelper(ForeignScanState *scanState,
+		               const bson *collectionDocument, char *arrayFieldName, bson_iterator *arrayCursor, int32 level);
+static TupleTableSlot *MongoIterateForeignScanArrayHelper0(ForeignScanState *scanState,
+		               const bson *collectionDocument, char *arrayFieldName);
 static Const * SerializeDocument(bson *document);
 static bson * DeserializeDocument(Const *constant);
 static double ForeignTableDocumentCount(Oid foreignTableId);
@@ -78,6 +82,9 @@ static HTAB * ColumnMappingHash(Oid foreignTableId, List *columnList);
 static void FillTupleSlot(const bson *currentDocument, const bson *parentDocument,
 						  HTAB *columnMappingHash, Datum *columnValues,
 						  bool *columnNulls);
+//static void FillTupleSlotHelperWithIterator(bson_iterator *currentDocument, const bson *parentDocument,
+//							    HTAB *columnMappingHash, Datum *columnValues,
+//							    bool *columnNulls, const char *prefix, bool *newDocStarted);
 static void FillTupleSlotHelper(const bson *currentDocument, const bson *parentDocument,
 							    HTAB *columnMappingHash, Datum *columnValues,
 							    bool *columnNulls, const char *prefix);
@@ -90,6 +97,9 @@ static ColumnValue CoerceColumnValue(bson_iterator *bsonIterator, const bson_typ
 									 Oid columnTypeId, int32 columnTypeMod);
 static void MongoFreeScanState(MongoFdwExecState *executionState);
 
+extern void my_bson_print_raw(const char *data , int depth );
+extern void my_bson_print( const bson *b );
+extern char** StrSplit(char* a_str, const char a_delim);
 
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
@@ -234,9 +244,19 @@ MongoGeneratePlanState(Oid foreignTableId, PlannerInfo *root, RelOptInfo *basere
 	 * the MongoDB server-side, so we instead filter out columns on our side.
 	 */
 	mongoFdwOptions = MongoGetOptions(foreignTableId);
+	ereport(INFO, (errmsg_internal("mongoFdwOptions->fieldname= %s", mongoFdwOptions->fieldName)));
+	ereport(INFO, (errmsg_internal("mongoFdwOptions->unwindFieldname= %s", mongoFdwOptions->unwindFieldName)));
 	opExpressionList = ApplicableOpExpressionList(baserel);
-	queryDocument = QueryDocument(foreignTableId, opExpressionList, mongoFdwOptions,
+	// if mongoFdwOptions includes field option then will use special queryDocument that uses agg fw
+	if (mongoFdwOptions->unwindFieldName && *mongoFdwOptions->unwindFieldName != NULL) {
+		// we're using the aggregation framework to unwind, so we have to query mongodb using the 'runCommand' style
+		queryDocument = CommandQueryDocument(foreignTableId, opExpressionList, mongoFdwOptions,
+				  columnMappingHash);
+	} else {
+		queryDocument = QueryDocument(foreignTableId, opExpressionList, mongoFdwOptions,
 								  columnMappingHash);
+	}
+	my_bson_print(queryDocument);
 	queryBuffer = SerializeDocument(queryDocument);
 
 	/* only clean up the query struct, but not its data */
@@ -412,11 +432,15 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	MongoFdwExecState *executionState = NULL;
 
+	bson *commandOutput = NULL;
+	bson_iterator *outputIterator = NULL;
+
 	/* if Explain with no Analyze, do nothing */
 	if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
 	{
 		return;
 	}
+	ereport(INFO, (errmsg_internal("Entered MongoBeginForeignScan")));
 
 	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
 	mongoFdwOptions = MongoGetOptions(foreignTableId);
@@ -471,6 +495,7 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 
 	queryBuffer = fdw_private->queryBuffer;
 	queryDocument = DeserializeDocument(queryBuffer);
+	my_bson_print(queryDocument);
 
 	columnList = fdw_private->columnList;
 	columnMappingHash = ColumnMappingHash(foreignTableId, columnList);
@@ -479,22 +504,56 @@ MongoBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	appendStringInfo(namespaceName, "%s.%s", mongoFdwOptions->databaseName,
 					 mongoFdwOptions->collectionName);
 
-	/* create cursor for collection name and set query */
-	mongoCursor = mongo_cursor_create();
-	mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
-	mongo_cursor_set_options(mongoCursor, MONGO_SLAVE_OK);
-	mongo_cursor_set_query(mongoCursor, queryDocument);
+
+	if (mongoFdwOptions->unwindFieldName && *mongoFdwOptions->unwindFieldName != NULL) { // using agg fw
+		bson_type bt;
+		int status = MONGO_OK;
+		mongo conn[1];
+		status = mongo_connect(conn, "127.0.0.1", 27017);
+		if (status != MONGO_OK) {
+			ereport(ERROR, (errmsg_internal("Failed to get connection")));
+		}
+		ereport(INFO, (errmsg_internal("MongoBeginForeignScan: running mongo command on db %s on querydoc of size= %d.",
+				mongoFdwOptions->databaseName, sizeof(queryDocument))));
+		commandOutput = bson_create();
+		bson_init(commandOutput);
+		//status = mongo_run_command(mongoConnection, mongoFdwOptions->databaseName, queryDocument, commandOutput);	// XXX returns bson* will need to iterate through that
+		status = mongo_run_command(conn, "test", queryDocument, commandOutput);	// XXX returns bson* will need to iterate through that
+		ereport(INFO, (errmsg_internal("MongoBeginForeignScan: finished mongo command..status= %d commandOutput size= %d  %d",
+				status, sizeof(commandOutput), bson_size(commandOutput))));
+		//my_bson_print(commandOutput);
+		outputIterator = bson_iterator_create();
+		bson_iterator_init(outputIterator, commandOutput);
+		// advance one iteration to get at contained array (the runCommand api wraps the result in a field)
+		bt = bson_iterator_next(outputIterator);
+		ereport(INFO, (errmsg_internal("MongoBeginForeignScan: first entry type: %d   key: %s", bt, bson_iterator_key(outputIterator))));
+		if (bt == BSON_ARRAY) {
+			bson_iterator_subobject(outputIterator, commandOutput);
+			bson_iterator_init(outputIterator, commandOutput);
+			ereport(INFO, (errmsg_internal("MongoBeginForeignScan: got subobject..commandOutput size= %d  %d", sizeof(commandOutput), bson_size(commandOutput))));
+		} else {
+			// something went horribly wrong..
+			ereport(ERROR, (errmsg("Mongo runCommand query did not return expected result format")));
+		}
+	} else {
+		/* create cursor for collection name and set query */
+		mongoCursor = mongo_cursor_create();
+		mongo_cursor_init(mongoCursor, mongoConnection, namespaceName->data);
+		mongo_cursor_set_options(mongoCursor, MONGO_SLAVE_OK);
+		mongo_cursor_set_query(mongoCursor, queryDocument);
+	}
+
 
 	/* create and set foreign execution state */
 	executionState = (MongoFdwExecState *) palloc0(sizeof(MongoFdwExecState));
 	executionState->columnMappingHash = columnMappingHash;
 	executionState->mongoConnection = mongoConnection;
 	executionState->mongoCursor = mongoCursor;
-	executionState->parentDocument = NULL;
-	executionState->arrayCursor = NULL;
-	executionState->arrayFieldName = mongoFdwOptions->fieldName;
+	executionState->parentDocument = NULL;	// DM unrolling in pg
+	executionState->arrayCursor = NULL;		// DM unrolling pg
+	executionState->arrayCursor2 = NULL;		// DM unrolling pg
+	executionState->arrayFieldName = mongoFdwOptions->fieldName;	// "field" option on table
 	executionState->queryDocument = queryDocument;
-
 	scanState->fdw_state = (void *) executionState;
 }
 
@@ -503,12 +562,19 @@ BsonFindSubobject(bson_iterator *bsonIterator, const bson *bsonObject, const cha
 {
 	bson_type bsonCursorStatus;
 	char *dot = strchr(path, '.');
+	bson *sub;
 	if (dot)
 	{
 		*dot = '\0';
 	}
 	bson_iterator_init(bsonIterator, bsonObject);
-	bsonCursorStatus = bson_find(bsonIterator, bsonObject, path);
+	//bsonCursorStatus = bson_find(bsonIterator, bsonObject, path);
+	while( bson_iterator_next( bsonIterator ) ) {
+		ereport(DEBUG2, (errmsg("....BsonFindSubobject...key= %s", bson_iterator_key(bsonIterator))));
+		if ( strcmp( path, bson_iterator_key( bsonIterator ) ) == 0 )
+			break;
+	}
+	bsonCursorStatus = bson_iterator_type( bsonIterator );
 
 	if (!dot)
 	{
@@ -521,7 +587,7 @@ BsonFindSubobject(bson_iterator *bsonIterator, const bson *bsonObject, const cha
 		return BSON_EOO;
 	}
 
-	bson *sub = bson_create();
+	sub = bson_create();
 	bson_iterator_subobject(bsonIterator, sub);
 	bsonCursorStatus = BsonFindSubobject(bsonIterator, sub, (dot + 1));
 	bson_dispose(sub);
@@ -540,16 +606,20 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
 	mongo_cursor *mongoCursor = executionState->mongoCursor;
 	HTAB *columnMappingHash = executionState->columnMappingHash;
-	bson_iterator *arrayCursor = executionState->arrayCursor;
+	int32 cursorStatus = MONGO_ERROR;
 	int32 mongoCursorStatus = MONGO_ERROR;
 	bson_type bsonCursorStatus;
 	const bson *collectionDocument = executionState->parentDocument;
+	bson *outputDocument = executionState->outputDocument;
+	bson_iterator *outputIterator = executionState->outputIterator;
+	bson_type fieldType;
 
 	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	Datum *columnValues = tupleSlot->tts_values;
 	bool *columnNulls = tupleSlot->tts_isnull;
 	int32 columnCount = tupleDescriptor->natts;
 
+	ereport(DEBUG2, (errmsg_internal("Entered MongoIterateForeignScan")));
 	/*
 	 * We execute the protocol to load a virtual tuple into a slot. We first
 	 * call ExecClearTuple, then fill in values / isnull arrays, and last call
@@ -564,6 +634,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 
 	while(true)
 	{
+		char *arrayFieldName;
 		if(!collectionDocument)
 		{
 			ereport(DEBUG2, (errmsg_internal("Getting collection document")));
@@ -588,7 +659,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 				}
 				else
 				{
-					ereport(DEBUG1, (errmsg_internal("Mongo cursor exhausted")));
+					ereport(INFO, (errmsg_internal("Mongo cursor exhausted")));
 				}
 				/* EXIT */
 				return tupleSlot;
@@ -597,7 +668,7 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 
 		/* Now we have a document from the collection */
 
-		char *arrayFieldName = executionState->arrayFieldName;
+		arrayFieldName = executionState->arrayFieldName;
 		if(!arrayFieldName || *arrayFieldName == '\0')
 		{
 			ereport(DEBUG2, (errmsg_internal("Filling tuple from collection document.")));
@@ -610,66 +681,397 @@ MongoIterateForeignScan(ForeignScanState *scanState)
 		}
 		else
 		{
-			ereport(DEBUG2, (errmsg_internal("Getting embedded array '%s'", arrayFieldName)));
-			/* We're iterating over an embedded array. */
-			if(!arrayCursor)
-			{
-				ereport(DEBUG2, (errmsg_internal("Getting array cursor from collection document")));
-				bson_iterator bsonIterator = { NULL, 0 };
-				bsonCursorStatus = BsonFindSubobject(&bsonIterator, collectionDocument, arrayFieldName);
+			// unwinding embedded array(s)
 
-				if (bsonCursorStatus == BSON_ARRAY) {
-					arrayCursor = bson_iterator_create();
-					bson_iterator_subiterator(&bsonIterator, arrayCursor);
+			ereport(DEBUG2, (errmsg_internal("found collectionDocument----->")));
+//			my_bson_print(collectionDocument);
+
+			// check if the request is for a nested array
+			//arrayFieldName = executionState->arrayFieldName;
+			ereport(DEBUG2, (errmsg_internal("splitting arrayFieldName= '%s' strlen= %u", arrayFieldName, strlen(arrayFieldName))));
+			char *arrayFieldNameCopy = malloc(1 + strlen(arrayFieldName));
+			strcpy(arrayFieldNameCopy, arrayFieldName);
+			char **fieldPathTokens;
+			fieldPathTokens = StrSplit(arrayFieldNameCopy, '.');
+			int numTokens = 0;
+			// count number of tokens
+			for (numTokens=0; *(fieldPathTokens+numTokens); numTokens++) {
+				;
+			}
+			ereport(DEBUG2, (errmsg_internal("there are %d tokens", numTokens)));
+
+			int i;
+			int j;
+			char fieldPath[2][512];
+			char **fieldPaths;
+			fieldPaths = malloc(sizeof(char*) * numTokens);
+
+			for (i=0; i<numTokens; i++) {
+				strcpy(fieldPath[i], "");
+				*(fieldPaths + i) = malloc(512);
+				strcpy(fieldPaths[i], "");
+			}
+			for (i=0; *(fieldPathTokens+i); i++) {
+				ereport(DEBUG2, (errmsg_internal("fieldPathTokens[%d]= %s", i, *(fieldPathTokens+i))));
+				for (j=i; j<numTokens; j++) {
+					if (i > 0) {
+						strcat(fieldPath[j], ".");
+						strcat(fieldPaths[j], ".");
+					}
+					strcat(fieldPath[j], *(fieldPathTokens+i));
+					strcat(fieldPaths[j], *(fieldPathTokens+i));
 				}
-				else
-				{
-					ereport(DEBUG2, (errmsg_internal("Can't find array on collection document.")));
-					/* The embedded array field is not present on this document.  Next! */
+			}
+			for (i=0; i<numTokens; i++) {
+				ereport(DEBUG2, (errmsg_internal("fieldPath[%d]= %s", i, fieldPath[i])));
+				ereport(DEBUG2, (errmsg_internal("fieldPaths[%d]= %s", i, fieldPaths[i])));
+			}
+
+			arrayFieldName = executionState->arrayFieldName;
+			ereport(DEBUG2, (errmsg_internal("arrayFieldName= %s", arrayFieldName)));
+
+			bson_iterator *arrayCursor  = executionState->arrayCursor;
+			bson_iterator *arrayCursor2 = executionState->arrayCursor2;
+			bson *arrayDocument  = NULL;
+			bson *arrayDocument2 = NULL;
+
+			ereport(DEBUG2, (errmsg_internal("arrayCursor= '%p'\tarrayCursor2= '%p'", arrayCursor, arrayCursor2)));
+
+			if (!arrayCursor2) {
+				// exhausted array2, so advance array1
+				arrayDocument = MongoIterateForeignScanArrayHelper(scanState, collectionDocument, fieldPathTokens[0],arrayCursor, 1);
+				arrayCursor = executionState->arrayCursor;
+				ereport(DEBUG2, (errmsg("advanced array1, arrayCursor='%p'", arrayCursor)));
+				if (!arrayCursor) {
+					// exhausted array1, so done with collection document
+					ereport(DEBUG2, (errmsg("exhausted array1, get next collection doc")));
+					bson_dispose(arrayDocument);
+					bson_iterator_dispose(arrayCursor);
+					bson_iterator_dispose(arrayCursor2);
 					executionState->parentDocument = collectionDocument = NULL;
+					executionState->arrayCursor  = arrayCursor  = NULL;
+					executionState->arrayCursor2 = arrayCursor2 = NULL;
+					continue;
+				}
+			} else {
+				arrayDocument = bson_create();
+				bson_iterator_subobject(arrayCursor, arrayDocument);
+			}
+			executionState->parentDocument = collectionDocument;
+			ereport(DEBUG2, (errmsg("helper returned arrayDoc: ")));
+			if (arrayDocument) {
+//				my_bson_print(arrayDocument);
+			}
+
+
+			if (arrayCursor2) {
+				ereport(DEBUG2, (errmsg("arrayCursor2 before first call (curr= %p %d):", arrayCursor2->cur, arrayCursor2->first)));
+			} else {
+				ereport(DEBUG2, (errmsg("arrayCursor2 before first call is NULL")));
+			}
+
+			if (numTokens == 2) {
+				arrayDocument2 = MongoIterateForeignScanArrayHelper(scanState, arrayDocument, fieldPathTokens[1], arrayCursor2, 2);
+
+				if (!arrayDocument2) {
+					ereport(DEBUG2, (errmsg("arrayDocument2 is null, freeing it and continue")));
+					bson_dispose(arrayDocument);
+					bson_dispose(arrayDocument2);
 					continue;
 				}
 			}
+			arrayCursor2 = executionState->arrayCursor2;
 
-			/* Now we have an array cursor */
-
-			bsonCursorStatus = bson_iterator_next(arrayCursor);
-			while(bsonCursorStatus && bsonCursorStatus != BSON_OBJECT)
-			{
-				ereport(DEBUG2, (errmsg_internal("Didn't get an object from array cursor.  Trying again.")));
-				bsonCursorStatus = bson_iterator_next(arrayCursor);
+			if (arrayCursor2) {
+				ereport(DEBUG2, (errmsg("arrayCursor2 after first call (curr= %p %d):", arrayCursor2->cur, arrayCursor2->first)));
+			} else {
+				ereport (DEBUG2, (errmsg("arrayCursor2 after first call is NULL")));
 			}
 
-			if (bsonCursorStatus != BSON_OBJECT) 
-			{
-				ereport(DEBUG2, (errmsg_internal("Ran out of documents in array cursor.  Freeing it and moving to next collection document.")));
-				/* No more objects in this array.  Next document! */
-				executionState->parentDocument = collectionDocument = NULL;
-				bson_iterator_dispose(arrayCursor);
-				executionState->arrayCursor = arrayCursor = NULL;
-				continue;
+			FillTupleSlotHelper(collectionDocument, NULL, columnMappingHash,
+									  columnValues, columnNulls, NULL);
+			FillTupleSlotHelper(arrayDocument, NULL, columnMappingHash,
+									  columnValues, columnNulls, fieldPath[0]);
+			if (numTokens == 2) {
+				FillTupleSlotHelper(arrayDocument2, NULL, columnMappingHash,
+												  columnValues, columnNulls, fieldPath[1]);
 			}
 
-			/* Now we have a document from the embedded array */
-			ereport(DEBUG2, (errmsg_internal("Found document in array")));
-			bson *arrayDocument = bson_create();
-			bson_iterator_subobject(arrayCursor, arrayDocument);
-			ereport(DEBUG2, (errmsg_internal("Filling tuple slot from array document")));
-			FillTupleSlot(arrayDocument, collectionDocument, columnMappingHash,
-					      columnValues, columnNulls);
-			ereport(DEBUG2, (errmsg_internal("Freeing array document")));
+			ereport(DEBUG2, (errmsg_internal("Freeing array documents")));
+
 			bson_dispose(arrayDocument);
+			bson_dispose(arrayDocument2);
+
 			ereport(DEBUG2, (errmsg_internal("Storing tuple")));
 			ExecStoreVirtualTuple(tupleSlot);
 
-			executionState->parentDocument = collectionDocument;
-			executionState->arrayCursor = arrayCursor;
-
+			free(fieldPathTokens);
+			for (i=0; i<numTokens; i++) {
+				free(fieldPaths[i]);
+			}
+			//free(fieldPaths);
+			free(arrayFieldNameCopy);
 			return tupleSlot;
-		}
+
+
+			if (!arrayDocument2) {
+				ereport(DEBUG2, (errmsg("arrayDocument is null, setting collectionDoc null")));
+				executionState->parentDocument = collectionDocument = NULL;
+				// XXX do we need to null and free arrayCursor?
+				//continue;
+				free(fieldPathTokens);
+				for (i=0; i<numTokens; i++) {
+					free(fieldPaths[i]);
+				}
+				//free(fieldPaths);
+				free(arrayFieldNameCopy);
+				return tupleSlot;
+			}
+
+			free(fieldPathTokens);
+			for (i=0; i<numTokens; i++) {
+				free(fieldPaths[i]);
+			}
+			//free(fieldPaths);
+			free(arrayFieldNameCopy);
+			return tupleSlot;
+			//return NULL;
+
+		}  /* end if (!arrayField) */
 	}
 }
 
+static bson *
+MongoIterateForeignScanArrayHelper(ForeignScanState *scanState, const bson *collectionDocument, char *arrayFieldName,
+		bson_iterator *arrayCursor, int32 level)
+{
+	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
+	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
+	HTAB *columnMappingHash = executionState->columnMappingHash;
+	bson_type bsonCursorStatus;
+	bson *outputDocument = executionState->outputDocument;
+	bson_iterator *outputIterator = executionState->outputIterator;
+	bson_type fieldType;
+
+	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+	Datum *columnValues = tupleSlot->tts_values;
+	bool *columnNulls = tupleSlot->tts_isnull;
+	int32 columnCount = tupleDescriptor->natts;
+
+	bson *arrayDocument;
+
+	ereport(DEBUG2, (errmsg_internal("Getting embedded array '%s'", arrayFieldName)));
+	/* We're iterating over an embedded array. */
+	if(!arrayCursor)
+	{
+		ereport(DEBUG2, (errmsg_internal("Getting array cursor from collection document")));
+		bson_iterator bsonIterator = { NULL, 0 };
+		bsonCursorStatus = BsonFindSubobject(&bsonIterator, collectionDocument, arrayFieldName);
+
+		if (bsonCursorStatus == BSON_ARRAY) {
+			arrayCursor = bson_iterator_create();
+			bson_iterator_subiterator(&bsonIterator, arrayCursor);
+			ereport(DEBUG2, (errmsg_internal("arrayCursor= '%p'", arrayCursor)));
+		}
+		else
+		{
+			ereport(DEBUG2, (errmsg_internal("Can't find array on collection document.")));
+			/* The embedded array field is not present on this document.  Next! */
+			executionState->parentDocument = collectionDocument = NULL;
+			return NULL;
+		}
+	}
+
+	/* Now we have an array cursor */
+
+	ereport(DEBUG2, (errmsg("SCAN_HELPER: arrayDocument before advancing cursor (curr= %p %d):", arrayCursor->cur, arrayCursor->first)));
+
+	bsonCursorStatus = bson_iterator_next(arrayCursor);
+
+
+	ereport(DEBUG2, (errmsg("SCAN_HELPER: arrayDocument after advancing cursor (curr= %p %d retval= %d)", arrayCursor->cur, arrayCursor->first, bsonCursorStatus)));
+
+	while(bsonCursorStatus && bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(DEBUG2, (errmsg_internal("Didn't get an object from array cursor.  Trying again.")));
+		bsonCursorStatus = bson_iterator_next(arrayCursor);
+	}
+
+	if (bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(DEBUG2, (errmsg_internal("Ran out of documents in array cursor.  Freeing it.")));
+		/* No more objects in this array.  Next document! */
+//		executionState->parentDocument = collectionDocument = NULL;
+
+		bson_iterator_dispose(arrayCursor);
+		if (level == 1) {
+			executionState->arrayCursor = arrayCursor = NULL;
+		} else {
+			executionState->arrayCursor2 = arrayCursor = NULL;
+		}
+		return NULL;
+	}
+
+	/* Now we have a document from the embedded array */
+	ereport(DEBUG2, (errmsg_internal("Found document in array '%s'", arrayFieldName)));
+	arrayDocument = bson_create();
+	bson_iterator_subobject(arrayCursor, arrayDocument);
+//	my_bson_print(arrayDocument);
+
+	if (level == 1) {
+		executionState->arrayCursor = arrayCursor;
+	} else if (level == 2) {
+		executionState->arrayCursor2 = arrayCursor;
+	}
+
+	return arrayDocument;
+
+}
+static TupleTableSlot *
+MongoIterateForeignScanArrayHelper0(ForeignScanState *scanState, const bson *collectionDocument, char *arrayFieldName)
+{
+	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
+	TupleTableSlot *tupleSlot = scanState->ss.ss_ScanTupleSlot;
+//	mongo_cursor *mongoCursor = executionState->mongoCursor;
+	HTAB *columnMappingHash = executionState->columnMappingHash;
+//	int32 cursorStatus = MONGO_ERROR;
+	bson_iterator *arrayCursor = executionState->arrayCursor;
+//	int32 mongoCursorStatus = MONGO_ERROR;
+	bson_type bsonCursorStatus;
+	//const bson *collectionDocument = executionState->parentDocument;
+	bson *outputDocument = executionState->outputDocument;
+	bson_iterator *outputIterator = executionState->outputIterator;
+	bson_type fieldType;
+
+	TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+	Datum *columnValues = tupleSlot->tts_values;
+	bool *columnNulls = tupleSlot->tts_isnull;
+	int32 columnCount = tupleDescriptor->natts;
+
+
+	//char *arrayFieldName;
+	bson *arrayDocument;
+	// check if the request is for a nested array
+	//arrayFieldName = executionState->arrayFieldName;
+	char **tokens;
+	tokens = StrSplit(arrayFieldName, '.');
+	char *token0 = "likes";
+	char *token1 = "activity";
+	ereport(INFO, (errmsg_internal("Getting embedded array '%s' and '%s'", token0, token1)));
+
+	ereport(INFO, (errmsg_internal("Getting embedded array '%s'", arrayFieldName)));
+//	ereport(INFO, (errmsg("found collectionDocument----->")));
+//	my_bson_print(collectionDocument);
+	/* We're iterating over an embedded array. */
+	if(!arrayCursor)
+	{
+		ereport(INFO, (errmsg_internal("Getting array cursor from collection document")));
+		bson_iterator bsonIterator = { NULL, 0 };
+		bsonCursorStatus = BsonFindSubobject(&bsonIterator, collectionDocument, arrayFieldName);
+
+		if (bsonCursorStatus == BSON_ARRAY) {
+			arrayCursor = bson_iterator_create();
+			bson_iterator_subiterator(&bsonIterator, arrayCursor);
+		}
+		else
+		{
+			ereport(INFO, (errmsg_internal("Can't find array on collection document.")));
+			/* The embedded array field is not present on this document.  Next! */
+			executionState->parentDocument = collectionDocument = NULL;
+			return NULL;
+		}
+	}
+
+	/* Now we have an array cursor */
+
+	bsonCursorStatus = bson_iterator_next(arrayCursor);
+	while(bsonCursorStatus && bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(INFO, (errmsg_internal("Didn't get an object from array cursor.  Trying again.")));
+		bsonCursorStatus = bson_iterator_next(arrayCursor);
+	}
+
+	if (bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(INFO, (errmsg_internal("Ran out of documents in array cursor.  Freeing it and moving to next collection document.")));
+		/* No more objects in this array.  Next document! */
+		executionState->parentDocument = collectionDocument = NULL;
+		bson_iterator_dispose(arrayCursor);
+		executionState->arrayCursor = arrayCursor = NULL;
+		return NULL;
+	}
+
+	/* Now we have a document from the embedded array */
+	ereport(INFO, (errmsg_internal("Found document in array 'likes'")));
+	arrayDocument = bson_create();
+	bson_iterator_subobject(arrayCursor, arrayDocument);
+	my_bson_print(arrayDocument);
+
+	///////////////////////////////////////////////////////
+	// XXX get nested array
+
+	bson_iterator *array2 = {NULL, 0};
+	bson_iterator *arrayCursor2;
+	bson *arrayDocument2;
+	bsonCursorStatus = BsonFindSubobject(&array2, arrayDocument, "plays");
+
+	if (bsonCursorStatus == BSON_ARRAY) {
+		arrayCursor2 = bson_iterator_create();
+		bson_iterator_subiterator(&array2, arrayCursor2);
+	}
+	else
+	{
+		ereport(INFO, (errmsg_internal("Can't find array on collection document.")));
+		/* The embedded array field is not present on this document.  Next! */
+		executionState->parentDocument = collectionDocument = NULL;
+		return NULL;
+	}
+
+
+	bsonCursorStatus = bson_iterator_next(arrayCursor2);
+	while(bsonCursorStatus && bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(INFO, (errmsg_internal("Didn't get an object from array cursor.  Trying again.")));
+		bsonCursorStatus = bson_iterator_next(arrayCursor2);
+	}
+
+	if (bsonCursorStatus != BSON_OBJECT)
+	{
+		ereport(INFO, (errmsg_internal("Ran out of documents in array 'plays' cursor.  Freeing it and moving to next collection document.")));
+		/* No more objects in this array.  Next document! */
+		executionState->parentDocument = collectionDocument = NULL;
+		bson_iterator_dispose(arrayCursor2);
+		executionState->arrayCursor = arrayCursor2 = NULL;
+		return NULL;
+	}
+	/* Now we have a document from the embedded array */
+	ereport(INFO, (errmsg_internal("Found document in array 'plays'")));
+	arrayDocument2 = bson_create();
+	bson_iterator_subobject(arrayCursor2, arrayDocument2);
+	my_bson_print(arrayDocument2);
+
+///////////////////////////////////////
+	ereport(INFO, (errmsg_internal("Filling tuple slot from array document")));
+//	FillTupleSlotHelper(arrayDocument, collectionDocument, columnMappingHash,
+//				      columnValues, columnNulls, arrayFieldName);
+	FillTupleSlotHelper(collectionDocument, NULL, columnMappingHash,
+						      columnValues, columnNulls, NULL);
+	FillTupleSlotHelper(arrayDocument, NULL, columnMappingHash,
+						      columnValues, columnNulls, arrayFieldName);
+	FillTupleSlotHelper(arrayDocument2, NULL, columnMappingHash,
+						      columnValues, columnNulls, "likes.plays");
+	ereport(INFO, (errmsg_internal("Freeing array document")));
+	bson_dispose(arrayDocument);
+	bson_dispose(arrayDocument2);
+	ereport(INFO, (errmsg_internal("Storing tuple")));
+	ExecStoreVirtualTuple(tupleSlot);
+
+	executionState->parentDocument = collectionDocument;
+	executionState->arrayCursor = arrayCursor;
+
+	return tupleSlot;
+
+}
 
 /*
  * MongoEndForeignScan finishes scanning the foreign table, closes the cursor
@@ -683,9 +1085,10 @@ MongoEndForeignScan(ForeignScanState *scanState)
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
 	mongoCursor = executionState->mongoCursor;
 
-	ereport(INFO, (errmsg_internal("Query returned %d documents.", 
+	if (mongoCursor) {
+		ereport(INFO, (errmsg_internal("Query returned %d documents.",
 								   mongoCursor->seen)));
-
+	}
 
 	/* if we executed a query, reclaim mongo related resources */
 	if (executionState != NULL)
@@ -703,13 +1106,13 @@ MongoEndForeignScan(ForeignScanState *scanState)
 static void
 MongoReScanForeignScan(ForeignScanState *scanState)
 {
-	ereport(DEBUG2, (errmsg_internal("Rescanning")));
 	MongoFdwExecState *executionState = (MongoFdwExecState *) scanState->fdw_state;
 	mongo *mongoConnection = executionState->mongoConnection;
 	MongoFdwOptions *mongoFdwOptions = NULL;
 	mongo_cursor *mongoCursor = NULL;
 	StringInfo namespaceName = NULL;
 	Oid foreignTableId = InvalidOid;
+	ereport(DEBUG2, (errmsg_internal("Rescanning")));
 
 	/* close down the old cursor */
 	mongo_cursor_destroy(executionState->mongoCursor);
@@ -922,6 +1325,7 @@ MongoGetOptions(Oid foreignTableId)
 	char *databaseName = NULL;
 	char *collectionName = NULL;
 	char *fieldName = NULL;
+	char *unwindFieldName = NULL;
 	char *username = NULL;
 	char *password = NULL;
 	char *useAuthStr = NULL;
@@ -968,6 +1372,8 @@ MongoGetOptions(Oid foreignTableId)
 	
 	fieldName = MongoGetOptionValue(optionList, OPTION_NAME_FIELD);
 
+	unwindFieldName = MongoGetOptionValue(optionList, OPTION_NAME_UNWIND_FIELD);
+
 	useAuthStr = MongoGetOptionValue(optionList, OPTION_NAME_USE_AUTH);
 	if (useAuthStr != NULL)
 	{
@@ -990,6 +1396,7 @@ MongoGetOptions(Oid foreignTableId)
 	mongoFdwOptions->databaseName = databaseName;
 	mongoFdwOptions->collectionName = collectionName;
 	mongoFdwOptions->fieldName = fieldName;
+	mongoFdwOptions->unwindFieldName = unwindFieldName;
 	mongoFdwOptions->username = username;
 	mongoFdwOptions->password = password;
 	mongoFdwOptions->useAuth = useAuth;
@@ -1116,6 +1523,7 @@ ColumnMappingHash(Oid foreignTableId, List *columnList)
 		void *hashKey = NULL;
 
 		columnName = get_relid_attribute_name(foreignTableId, columnId);
+		//ereport(INFO, (errmsg("ColMapHash: colname= %s", columnName)));
 		hashKey = (void *) columnName;
 
 		columnMapping = (ColumnMapping *) hash_search(columnMappingHash, hashKey,
@@ -1152,10 +1560,12 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 		            HTAB *columnMappingHash, Datum *columnValues,
 					bool *columnNulls, const char *prefix)
 {
+	ereport(DEBUG2, (errmsg("FillTupleSlotHelper entered for prefix= %s", prefix)));
 	if(parentDocument)
 	{
 		FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues,
-							columnNulls, "parent");
+							//columnNulls, "parent");
+				            columnNulls, NULL);
 	}
 
 	bson_iterator bsonIterator = { NULL, 0 };
@@ -1164,7 +1574,7 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 	while (bson_iterator_next(&bsonIterator))
 	{
 		const char *bsonKey = bson_iterator_key(&bsonIterator);
-		ereport(DEBUG2, (errmsg_internal("Next document field: %s", bsonKey)));
+		ereport(DEBUG2, (errmsg_internal("....Next document field: %s", bsonKey)));
 		bson_type bsonType = bson_iterator_type(&bsonIterator);
 
 		ColumnMapping *columnMapping = NULL;
@@ -1223,6 +1633,158 @@ FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
 
 	ereport(DEBUG2, (errmsg_internal("Finished document.")));
 }
+//static void
+//FillTupleSlot(const bson *bsonDocument, const bson *parentDocument,
+//			  HTAB *columnMappingHash, Datum *columnValues, bool *columnNulls)
+//{
+//	bool newDocStarted[1];
+//	*newDocStarted = false;
+//	FillTupleSlotHelper(bsonDocument, parentDocument, columnMappingHash,
+//			columnValues, columnNulls, NULL, newDocStarted);
+//}
+//
+//
+//static void
+//FillTupleSlotHelperWithIterator(bson_iterator *bsonIterator, const bson *parentDocument,
+//		            HTAB *columnMappingHash, Datum *columnValues,
+//					bool *columnNulls, const char *prefix, bool *newDocStarted)
+//{
+////	if(parentDocument)
+////	{
+////		FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues,
+////							columnNulls, "parent");
+////	}
+////
+////	bson_iterator bsonIterator = { NULL, 0 };
+////	bson_iterator_init(&bsonIterator, bsonDocument);
+//	ereport(INFO, (errmsg("FillTupleSlotHelperWithIterator entered..........newDocStarted= %d", *newDocStarted)));
+//	bson_iterator *prev;
+//	prev = bson_iterator_create();
+//	prev->cur = bsonIterator->cur;
+//	prev->first = bsonIterator->first;
+//	while (bson_iterator_next(bsonIterator))
+//	{
+//		bson_type bsonType;
+//		const char *bsonKey = bson_iterator_key(bsonIterator);
+//		bsonType = bson_iterator_type(bsonIterator);
+//		ereport(INFO, (errmsg_internal("    Type: %d\tNext document field: '%s'  newDocStarted= %d", bsonType, bsonKey, *newDocStarted)));
+//		// check if key is an int, in which case we started a new document
+//		// do this by trying to convert key to int, then back to string, if the resulting
+//		// string equals the original key then it was an int marking the start of a new document
+//		char str[10];
+//		sprintf(str, "%d", atoi(bsonKey));
+//		if (bsonType == BSON_OBJECT && strcmp(str, bsonKey) == 0 ) {
+//			ereport(INFO, (errmsg_internal("newDocStarted check for %s returned true and newDocStarted= %d",bsonKey, *newDocStarted)));
+//			if (*newDocStarted) {
+//				ereport(INFO,(errmsg("newDocStarted was true and found again, exiting..")));
+//				// whoop..back it up
+//				bsonIterator->cur = prev->cur;
+//				bsonIterator->first = prev->first;
+//				break;
+//			} else {
+//				ereport(INFO,(errmsg("newDocStarted was false and found so setting true..")));
+//				*newDocStarted = true;
+//			}
+//		}
+//		// advance prev to current
+//		bson_iterator_next(prev);
+//
+//		ColumnMapping *columnMapping = NULL;
+//		bool handleFound = false;
+//		const char *qualifiedKey = NULL;
+//
+//		void *hashKey;
+//
+//
+//		if (prefix && strcmp(prefix, ""))	// if prefix is "", then we don't want to create "".bsonKey as qualifiedKey
+//		{
+//			/* for fields in nested BSON objects, use fully qualified field
+//			 * name to check the column mapping */
+//			StringInfo qualifiedKeyInfo = makeStringInfo();
+//			appendStringInfo(qualifiedKeyInfo, "%s.%s", prefix, bsonKey);
+//			qualifiedKey = qualifiedKeyInfo->data;
+//		}
+//		else
+//		{
+//			qualifiedKey = bsonKey;
+//		}
+//
+//		/* recurse into nested objects */
+//		if (bsonType == BSON_OBJECT)
+//		{
+//			// if first document is nested, then we need to reset the qualifiedKey
+//			if (!prefix) {
+//				qualifiedKey = "";
+//			}
+//			bson *sub = bson_create();
+//			bson_iterator_subobject(bsonIterator, sub);
+//			ereport(DEBUG2, (errmsg_internal("Recursing into sub-document: %p for key: %s", sub, qualifiedKey)));
+//			FillTupleSlotHelper(sub, parentDocument, columnMappingHash,
+//								columnValues, columnNulls, qualifiedKey, newDocStarted);
+//			ereport(DEBUG2, (errmsg_internal("Destroying sub-document: %p, %p", sub,
+//											 sub->data)));
+//			bson_dispose(sub);
+//			ereport(DEBUG2, (errmsg_internal("Destroyed sub-document")));
+//			continue;
+//		}
+//
+//		/* look up the corresponding column for this bson key */
+//		hashKey = (void *) qualifiedKey;
+//		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+//													  hashKey, HASH_FIND,
+//													  &handleFound);
+//		//ereport(INFO, (errmsg_internal("bsonKey= %s  colName= %s  colIndex= %d", bsonKey, columnMapping->columnName, columnMapping->columnIndex)));
+//
+//		FillTupleSlotColumn(columnMapping, bsonType, bsonIterator,
+//							columnValues, columnNulls);
+//
+//		if (bsonType == BSON_OID)
+//		{
+//			StringInfo generatedTimeKeyInfo = makeStringInfo();
+//			appendStringInfo(generatedTimeKeyInfo, "%s.generated",
+//							 qualifiedKey);
+//			columnMapping = (ColumnMapping *) hash_search(
+//				columnMappingHash, (void *)generatedTimeKeyInfo->data,
+//				HASH_FIND, &handleFound);
+//			FillTupleSlotColumn(columnMapping, bsonType, bsonIterator,
+//								columnValues, columnNulls);
+//		}
+//	}
+//
+//
+//	ereport(INFO, (errmsg_internal("Finished document..newDocStarted= %d", *newDocStarted)));
+//}
+//
+//static void
+//FillTupleSlotHelper(const bson *bsonDocument, const bson *parentDocument,
+//        HTAB *columnMappingHash, Datum *columnValues,
+//		bool *columnNulls, const char *prefix, bool *newDocStarted)
+//{
+//		ereport(INFO, (errmsg("FillTupleSlotHelper entered")));
+//		if(parentDocument)
+//		{
+//			FillTupleSlotHelper(parentDocument, NULL, columnMappingHash, columnValues,
+//								columnNulls, "", newDocStarted);
+//			                    //columnNulls, "parent", newDocStarted);
+//		//}
+//
+//			bson_iterator *bsonIterator = bson_iterator_create();
+//			bson_iterator_init(bsonIterator, bsonDocument);
+//
+//			FillTupleSlotHelperWithIterator(bsonIterator, parentDocument, columnMappingHash,
+//							columnValues, columnNulls, "likes", newDocStarted);
+//		} else {
+//
+//			bson_iterator *bsonIterator = bson_iterator_create();
+//			bson_iterator_init(bsonIterator, bsonDocument);
+//
+//			FillTupleSlotHelperWithIterator(bsonIterator, parentDocument, columnMappingHash,
+//							columnValues, columnNulls, prefix, newDocStarted);
+//		}
+//
+//		ereport(INFO, (errmsg("FillTupleSlotHelper exiting..............")));
+//
+//}
 
 static void
 FillTupleSlotColumn(const ColumnMapping *columnMapping,
@@ -1232,11 +1794,15 @@ FillTupleSlotColumn(const ColumnMapping *columnMapping,
 	Oid columnTypeId = InvalidOid;
 	Oid columnArrayTypeId = InvalidOid;
 	bool compatibleTypes = false;
+
 	/* if no corresponding column or null bson value, continue */
 	if (columnMapping == NULL || bsonType == BSON_NULL)
 	{
 		return;
 	}
+	ereport(DEBUG2, (errmsg("FillTupleSlot: colname= %s  bson_type= %d",
+				columnMapping->columnName,
+				columnMapping->columnBsonType)));
 
 	/* check if columns have compatible types */
 	columnTypeId = columnMapping->columnTypeId;
@@ -1277,6 +1843,7 @@ FillTupleSlotColumn(const ColumnMapping *columnMapping,
 		{
 			columnValues[columnIndex] = columnValue.datum;
 			columnNulls[columnIndex] = false;
+			ereport(DEBUG2, (errmsg("----->FillTupleSlotColumn %d\t%d\t%p", columnIndex, columnTypeMod, columnValue.datum)));
 		}
 	}
 }
@@ -1397,6 +1964,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 	{
 		bson_type bsonType = bson_iterator_type(&bsonSubIterator);
 		bool compatibleTypes = false;
+		ColumnValue columnValue;
 
 		compatibleTypes = ColumnTypesCompatible(bsonType, valueTypeId);
 		if (bsonType == BSON_NULL || !compatibleTypes)
@@ -1404,7 +1972,7 @@ ColumnValueArray(bson_iterator *bsonIterator, Oid valueTypeId)
 			continue;
 		}
 
-		ColumnValue columnValue = CoerceColumnValue(&bsonSubIterator, bsonType, valueTypeId, 0);
+		columnValue = CoerceColumnValue(&bsonSubIterator, bsonType, valueTypeId, 0);
 		if (columnValue.isNull)
 		{
 			continue;
@@ -1683,6 +2251,7 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 		case BPCHAROID:
 		{
 			const char *value = BsonString(bsonIterator, bsonType);
+			ereport(DEBUG2, (errmsg("value = %s", value)));
 			Datum valueDatum = CStringGetDatum(value);
 
 			columnValue.datum = DirectFunctionCall3(bpcharin, valueDatum,
@@ -1693,6 +2262,7 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 		case VARCHAROID:
 		{
 			const char *value = BsonString(bsonIterator, bsonType);
+			ereport(DEBUG2, (errmsg("value = %s", value)));
 			Datum valueDatum = CStringGetDatum(value);
 
 			columnValue.datum = DirectFunctionCall3(varcharin, valueDatum,
@@ -1703,6 +2273,7 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 		case TEXTOID:
 		{
 			const char *value = BsonString(bsonIterator, bsonType);
+			ereport(DEBUG2, (errmsg("value = %s", value)));
 			columnValue.datum = CStringGetTextDatum(value);
 			break;
 		}
@@ -1723,6 +2294,8 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 		case DATEOID:
 		{
 			int64 valueMillis = 0;
+			int64 valueMicros;
+			int64 timestamp;
 			switch (bsonType)
 			{
 				case BSON_DATE:
@@ -1759,8 +2332,8 @@ CoerceColumnValue(bson_iterator *bsonIterator, const bson_type bsonType, Oid col
 					break;
 				}
 			}
-			int64 valueMicros = (valueMillis * 1000L);
-			int64 timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
+			valueMicros = (valueMillis * 1000L);
+			timestamp = valueMicros - POSTGRES_TO_UNIX_EPOCH_USECS;
 			Datum timestampDatum = TimestampGetDatum(timestamp);
 
 			columnValue.datum = DirectFunctionCall1(timestamp_date, timestampDatum);
@@ -1854,3 +2427,4 @@ MongoFreeScanState(MongoFdwExecState *executionState)
 	mongo_destroy(executionState->mongoConnection);
 	mongo_dispose(executionState->mongoConnection);
 }
+

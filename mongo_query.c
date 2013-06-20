@@ -29,6 +29,9 @@
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 
+#include <string.h>
+#include <assert.h>
+
 
 /* Local functions forward declarations */
 static Expr * FindArgumentOfType(List *argumentList, NodeTag argumentType);
@@ -38,7 +41,111 @@ static List * UniqueColumnList(List *operatorList);
 static List * ColumnOperatorList(Var *column, List *operatorList);
 static void AppendConstantValue(bson *queryDocument, const char *keyName,
 								const bson_type toBsonType, Const *constant);
+char** StrSplit(char* a_str, const char a_delim);
 
+void my_bson_print_raw(const char *data , int depth );
+void my_bson_print( const bson *b );
+
+
+void my_bson_print_raw( const char *data , int depth ) {
+    bson_iterator i;
+    const char *key;
+    int temp;
+    bson_timestamp_t ts;
+    char oidhex[25];
+    bson scope;
+    const char *indent;
+    bson_iterator_from_buffer( &i, data );
+
+    //ereport(INFO, (errmsg_internal("Entered my_bson_print for data= %s  i= %s  depth= %d", data, i, depth)));
+    while ( bson_iterator_next( &i ) ) {
+        bson_type t = bson_iterator_type( &i );
+        if ( t == 0 )
+            break;
+        key = bson_iterator_key( &i );
+
+        switch (depth) {
+        case 0:
+        	indent = "  ";
+        	break;
+        case 1:
+        	indent = "    ";
+        	break;
+        case 2:
+        	indent = "      ";
+        	break;
+        case 3:
+        	indent = "        ";
+        	break;
+        default:
+        	indent = "          ";
+        }
+
+        switch ( t ) {
+        case BSON_DOUBLE:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %f",indent, key , t , bson_iterator_double( &i ) )));
+            break;
+        case BSON_STRING:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %s",indent, key , t , bson_iterator_string( &i ) )));
+            break;
+        case BSON_SYMBOL:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t SYMBOL: %s",indent, key , t , bson_iterator_string( &i ) )));
+            break;
+        case BSON_OID:
+            bson_oid_to_string( bson_iterator_oid( &i ), oidhex );
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %s",indent, key , t , oidhex )));
+            break;
+        case BSON_BOOL:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %s",indent, key , t , bson_iterator_bool( &i ) ? "true" : "false" )));
+            break;
+        case BSON_DATE:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %ld",indent, key , t , ( long int )bson_iterator_date( &i ) )));
+            break;
+        case BSON_BINDATA:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_BINDATA",indent , key , t)));
+            break;
+        case BSON_UNDEFINED:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_UNDEFINED",indent, key , t )));
+            break;
+        case BSON_NULL:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_NULL",indent, key , t )));
+            break;
+        case BSON_REGEX:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_REGEX: %s",indent, key , t, bson_iterator_regex( &i ) )));
+            break;
+        case BSON_CODE:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_CODE: %s",indent, key , t, bson_iterator_code( &i ) )));
+            break;
+        case BSON_CODEWSCOPE:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t BSON_CODE_W_SCOPE: %s",indent, key , t, bson_iterator_code( &i ) )));
+            bson_init( &scope );
+            bson_iterator_code_scope( &i, &scope );
+            ereport(INFO, (errmsg_internal( "\n\t SCOPE: " )));
+            bson_print( &scope );
+            break;
+        case BSON_INT:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %d",indent, key , t , bson_iterator_int( &i ) )));
+            break;
+        case BSON_LONG:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t %lld",indent, key , t , ( uint64_t )bson_iterator_long( &i ) )));
+            break;
+        case BSON_TIMESTAMP:
+            ts = bson_iterator_timestamp( &i );
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t i: %d, t: %d",indent, key , t, ts.i, ts.t )));
+            break;
+        case BSON_OBJECT:
+        case BSON_ARRAY:
+            ereport(INFO, (errmsg_internal( "%s %s : %d \t ",indent , key , t)));
+            my_bson_print_raw( bson_iterator_value( &i ) , depth + 1 );
+            break;
+        default:
+        	ereport(INFO, (errmsg_internal( "%s %s : %d \t can't print type : %d",indent , key , t , t )));
+        }
+    }
+}
+void my_bson_print( const bson *b ) {
+    my_bson_print_raw( b->data , 0 );
+}
 
 /*
  * ApplicableOpExpressionList walks over all filter clauses that relate to this
@@ -182,6 +289,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 	int prefix_len = strlen(prefix);
 	StringInfo columnNameInfo = NULL;
 
+	ereport(INFO, (errmsg_internal("Entered QueryDocument")));
 	queryDocument = bson_create();
 	bson_init(queryDocument);
 
@@ -210,9 +318,11 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
 		Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
 
+		void *hashKey;
+
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
-		void *hashKey = (void *) columnName;
+		hashKey = (void *) columnName;
 		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
 													  hashKey, HASH_FIND,
 													  &handleFound);
@@ -245,6 +355,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		}
 
 		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
+		//my_bson_print(queryDocument, 0);
 
 		if (dot) {
 			*dot = '.';
@@ -274,10 +385,11 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 		bson_type toBsonType = -1;
 		ColumnMapping *columnMapping = NULL;
 		bool handleFound = false;
+		void *hashKey;
 
 		columnId = column->varattno;
 		columnName = get_relid_attribute_name(relationId, columnId);
-		void *hashKey = (void *) columnName;
+		hashKey = (void *) columnName;
 		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
 													  hashKey, HASH_FIND,
 													  &handleFound);
@@ -314,6 +426,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 
 		/* for comparison expressions, start a sub-document */
 		bson_append_start_object(queryDocument, columnName);
+		//my_bson_print(queryDocument, 0);
 
 		if (dot) {
 			*dot = '.';
@@ -332,12 +445,16 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 			mongoOperatorName = MongoOperatorName(operatorName);
 
 			AppendConstantValue(queryDocument, mongoOperatorName, toBsonType, constant);
+			//my_bson_print(queryDocument, 0);
 		}
 
 		bson_append_finish_object(queryDocument);
+		//my_bson_print(queryDocument, 0);
 	}
 
 	documentStatus = bson_finish(queryDocument);
+	ereport(INFO, (errmsg_internal("Leaving QueryDocument")));
+	my_bson_print(queryDocument);
 	if (documentStatus != BSON_OK)
 	{
 		ereport(ERROR, (errmsg("could not create document for query"),
@@ -348,6 +465,239 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 }
 
 
+bson *
+CommandQueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions,
+		      struct HTAB *columnMappingHash)
+{
+	List *equalityOperatorList = NIL;
+	List *comparisonOperatorList = NIL;
+	List *columnList = NIL;
+	ListCell *equalityOperatorCell = NULL;
+	ListCell *columnCell = NULL;
+	bson *queryDocument = NULL;
+	int documentStatus = BSON_OK;
+	char *prefix = "parent.";
+	char *oidGeneratedKeySuffix = ".generated";
+	int prefix_len = strlen(prefix);
+	StringInfo columnNameInfo = NULL;
+
+	ereport(INFO, (errmsg_internal("Entered CommandQueryDocument")));
+	ereport(INFO, (errmsg("collection= %s  unwindField= %s", mongoFdwOptions->collectionName,
+			mongoFdwOptions->unwindFieldName)));
+	char **tokens;
+	tokens = StrSplit(mongoFdwOptions->unwindFieldName, '.');
+	ereport(INFO, (errmsg("%s", *tokens)));
+	queryDocument = bson_create();
+	bson_init(queryDocument);
+	//bson_append_string(queryDocument, "aggregate", "users");
+	bson_append_string(queryDocument, "aggregate", mongoFdwOptions->collectionName);
+	bson_append_start_array(queryDocument, "pipeline");
+	if (tokens) {
+		int i;
+		char fieldPath[512];
+		strcpy(fieldPath, "$");
+		// we need to construct a string like "$field1" and "$field1.field2" etc.
+		ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
+		for (i=0; *(tokens+i); i++) {
+			if (i > 0) {
+				strcat(fieldPath, ".");
+			}
+			ereport(INFO, (errmsg("%d fieldPath= %s", i, fieldPath)));
+			strcat(fieldPath, *(tokens+i));
+			ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
+			char str[10];
+			sprintf(str, "%d", i);
+
+			bson_append_start_object(queryDocument, str);
+			bson_append_string(queryDocument, "$unwind", fieldPath);
+		    bson_append_finish_object(queryDocument);
+		    free(*(tokens+i));
+
+//			bson_append_start_object(queryDocument, "0");
+//			bson_append_string(queryDocument, "$unwind", "$likes");
+//		    bson_append_finish_object(queryDocument);
+		}
+		free(tokens);
+//		bson_append_start_object(queryDocument, "1");
+//		bson_append_string(queryDocument, "$unwind", "$likes.plays");
+//	    bson_append_finish_object(queryDocument);
+	}
+	bson_append_finish_array(queryDocument);
+	bson_finish(queryDocument);
+	ereport(INFO, (errmsg("queryDocument----------------->")));
+	my_bson_print(queryDocument);
+	return queryDocument;
+
+
+	/*
+	 * We distinguish between equality expressions and others since we need to
+	 * insert the latter (<, >, <=, >=, <>) as separate sub-documents into the
+	 * BSON query object.
+	 */
+	equalityOperatorList = EqualityOperatorList(opExpressionList);
+	comparisonOperatorList = list_difference(opExpressionList, equalityOperatorList);
+
+	/* append equality expressions to the query */
+	foreach(equalityOperatorCell, equalityOperatorList)
+	{
+		OpExpr *equalityOperator = (OpExpr *) lfirst(equalityOperatorCell);
+		Oid columnId = InvalidOid;
+		char *columnName = NULL;
+		int suffixLen = strlen(oidGeneratedKeySuffix);
+		int columnNameLen = 0;
+		char *dot = NULL;
+		bson_type toBsonType = -1;
+		bool handleFound = false;
+		ColumnMapping *columnMapping = NULL;
+		void *hashKey;
+
+		List *argumentList = equalityOperator->args;
+		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
+		Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
+
+		columnId = column->varattno;
+		columnName = get_relid_attribute_name(relationId, columnId);
+		hashKey = (void *) columnName;
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  hashKey, HASH_FIND,
+													  &handleFound);
+		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
+			if (strncmp(columnName, prefix, prefix_len) == 0)
+			{
+				columnName = columnName + prefix_len;
+			}
+			else
+			{
+				columnNameInfo = makeStringInfo();
+				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+								 columnName);
+				columnName = columnNameInfo->data;
+			}
+		}
+
+		columnNameLen = strlen(columnName);
+		if (columnNameLen > suffixLen &&
+			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+		{
+			dot = columnName + (columnNameLen - suffixLen);
+			/* Chop .generated off of the keyname to get the oid name */
+			*dot = '\0';
+			toBsonType = BSON_OID;
+		}
+		else if(columnMapping)
+		{
+			toBsonType = columnMapping->columnBsonType;
+		}
+
+		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
+		//my_bson_print(queryDocument, 0);
+
+		if (dot) {
+			*dot = '.';
+		}
+	}
+
+	/*
+	 * For comparison expressions, we need to group them by their columns and
+	 * append all expressions that correspond to a column as one sub-document.
+	 * Otherwise, even when we have two expressions to define the upper- and
+	 * lower-bound of a range, Mongo uses only one of these expressions during
+	 * an index search.
+	 */
+	columnList = UniqueColumnList(comparisonOperatorList);
+
+	/* append comparison expressions, grouped by columns, to the query */
+	foreach(columnCell, columnList)
+	{
+		Var *column = (Var *) lfirst(columnCell);
+		Oid columnId = InvalidOid;
+		char *columnName = NULL;
+		List *columnOperatorList = NIL;
+		ListCell *columnOperatorCell = NULL;
+		int suffixLen = strlen(oidGeneratedKeySuffix);
+		int columnNameLen = 0;
+		char *dot = NULL;
+		bson_type toBsonType = -1;
+		ColumnMapping *columnMapping = NULL;
+		bool handleFound = false;
+		void *hashKey;
+
+		columnId = column->varattno;
+		columnName = get_relid_attribute_name(relationId, columnId);
+		hashKey = (void *) columnName;
+		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+													  hashKey, HASH_FIND,
+													  &handleFound);
+		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
+			if (strncmp(columnName, prefix, prefix_len) == 0)
+			{
+				columnName = columnName + prefix_len;
+			}
+			else
+			{
+				columnNameInfo = makeStringInfo();
+				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+								 columnName);
+				columnName = columnNameInfo->data;
+			}
+		}
+
+		columnNameLen = strlen(columnName);
+		if (columnNameLen > suffixLen &&
+			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+		{
+			dot = columnName + (columnNameLen - suffixLen);
+			/* Chop .generated off of the keyname to get the oid name */
+			*dot = '\0';
+			toBsonType = BSON_OID;
+		}
+		else if(columnMapping)
+		{
+			toBsonType = columnMapping->columnBsonType;
+		}
+
+		/* find all expressions that correspond to the column */
+		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
+
+		/* for comparison expressions, start a sub-document */
+		bson_append_start_object(queryDocument, columnName);
+		//my_bson_print(queryDocument, 0);
+
+		if (dot) {
+			*dot = '.';
+		}
+
+		foreach(columnOperatorCell, columnOperatorList)
+		{
+			OpExpr *columnOperator = (OpExpr *) lfirst(columnOperatorCell);
+			char *operatorName = NULL;
+			char *mongoOperatorName = NULL;
+
+			List *argumentList = columnOperator->args;
+			Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
+
+			operatorName = get_opname(columnOperator->opno);
+			mongoOperatorName = MongoOperatorName(operatorName);
+
+			AppendConstantValue(queryDocument, mongoOperatorName, toBsonType, constant);
+			//my_bson_print(queryDocument, 0);
+		}
+
+		bson_append_finish_object(queryDocument);
+		//my_bson_print(queryDocument, 0);
+	}
+
+	documentStatus = bson_finish(queryDocument);
+	ereport(INFO, (errmsg_internal("Leaving QueryDocument")));
+	my_bson_print(queryDocument);
+	if (documentStatus != BSON_OK)
+	{
+		ereport(ERROR, (errmsg("could not create document for query"),
+						errhint("BSON error: %s", queryDocument->errstr)));
+	}
+
+	return queryDocument;
+}
 /*
  * MongoOperatorName takes in the given PostgreSQL comparison operator name, and
  * returns its equivalent in MongoDB.
@@ -832,4 +1182,51 @@ ColumnList(RelOptInfo *baserel)
 	}
 
 	return columnList;
+}
+
+char** StrSplit(char* a_str, const char a_delim)
+{
+    char** result    = 0;
+    size_t count     = 0;
+    char* tmp        = a_str;
+    char* last_comma = 0;
+
+    /* Count how many elements will be extracted. */
+    while (*tmp)
+    {
+        if (a_delim == *tmp)
+        {
+            count++;
+            last_comma = tmp;
+        }
+        tmp++;
+    }
+
+    /* Add space for trailing token. */
+    count += last_comma < (a_str + strlen(a_str) - 1);
+
+    /* Add space for terminating null string so caller
+       knows where the list of returned strings ends. */
+    count++;
+
+    result = malloc(sizeof(char*) * count);
+
+    if (result)
+    {
+        size_t idx  = 0;
+        //char* token = strtok(a_str, ",");
+        char* token = strtok(a_str, &a_delim);
+
+        while (token)
+        {
+            assert(idx < count);
+            *(result + idx++) = strdup(token);
+            //token = strtok(0, ",");
+            token = strtok(0, &a_delim);
+        }
+        assert(idx == count - 1);
+        *(result + idx) = 0;
+    }
+
+    return result;
 }
