@@ -122,6 +122,7 @@ typedef struct MongoFdwExecState
 	char *arrayFieldName;
 	bson_iterator *arrayCursor;
 	bson_iterator *arrayCursor2;
+	bson_iterator *arrayCursor3;
 	bson *queryDocument;
 } MongoFdwExecState;
 
@@ -156,9 +157,9 @@ extern List * ApplicableOpExpressionList(RelOptInfo *baserel);
 extern bson * QueryDocument(Oid relationId, List *opExpressionList,
 							MongoFdwOptions* mongoFdwOptions,
 							struct HTAB *columnMappingHash);
-extern bson * CommandQueryDocument(Oid relationId, List *opExpressionList,
-								   MongoFdwOptions* mongoFdwOptions,
-								   struct HTAB *columnMappingHash);
+//extern bson * CommandQueryDocument(Oid relationId, List *opExpressionList,
+//								   MongoFdwOptions* mongoFdwOptions,
+//								   struct HTAB *columnMappingHash);
 extern List * ColumnList(RelOptInfo *baserel);
 
 /* Function declarations for foreign data wrapper */

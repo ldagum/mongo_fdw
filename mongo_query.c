@@ -289,7 +289,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 	int prefix_len = strlen(prefix);
 	StringInfo columnNameInfo = NULL;
 
-	ereport(INFO, (errmsg_internal("Entered QueryDocument")));
+	ereport(DEBUG2, (errmsg_internal("Entered QueryDocument")));
 	queryDocument = bson_create();
 	bson_init(queryDocument);
 
@@ -453,7 +453,7 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 	}
 
 	documentStatus = bson_finish(queryDocument);
-	ereport(INFO, (errmsg_internal("Leaving QueryDocument")));
+	ereport(DEBUG2, (errmsg_internal("Leaving QueryDocument")));
 	my_bson_print(queryDocument);
 	if (documentStatus != BSON_OK)
 	{
@@ -465,239 +465,239 @@ QueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwO
 }
 
 
-bson *
-CommandQueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions,
-		      struct HTAB *columnMappingHash)
-{
-	List *equalityOperatorList = NIL;
-	List *comparisonOperatorList = NIL;
-	List *columnList = NIL;
-	ListCell *equalityOperatorCell = NULL;
-	ListCell *columnCell = NULL;
-	bson *queryDocument = NULL;
-	int documentStatus = BSON_OK;
-	char *prefix = "parent.";
-	char *oidGeneratedKeySuffix = ".generated";
-	int prefix_len = strlen(prefix);
-	StringInfo columnNameInfo = NULL;
-
-	ereport(INFO, (errmsg_internal("Entered CommandQueryDocument")));
-	ereport(INFO, (errmsg("collection= %s  unwindField= %s", mongoFdwOptions->collectionName,
-			mongoFdwOptions->unwindFieldName)));
-	char **tokens;
-	tokens = StrSplit(mongoFdwOptions->unwindFieldName, '.');
-	ereport(INFO, (errmsg("%s", *tokens)));
-	queryDocument = bson_create();
-	bson_init(queryDocument);
-	//bson_append_string(queryDocument, "aggregate", "users");
-	bson_append_string(queryDocument, "aggregate", mongoFdwOptions->collectionName);
-	bson_append_start_array(queryDocument, "pipeline");
-	if (tokens) {
-		int i;
-		char fieldPath[512];
-		strcpy(fieldPath, "$");
-		// we need to construct a string like "$field1" and "$field1.field2" etc.
-		ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
-		for (i=0; *(tokens+i); i++) {
-			if (i > 0) {
-				strcat(fieldPath, ".");
-			}
-			ereport(INFO, (errmsg("%d fieldPath= %s", i, fieldPath)));
-			strcat(fieldPath, *(tokens+i));
-			ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
-			char str[10];
-			sprintf(str, "%d", i);
-
-			bson_append_start_object(queryDocument, str);
-			bson_append_string(queryDocument, "$unwind", fieldPath);
-		    bson_append_finish_object(queryDocument);
-		    free(*(tokens+i));
-
-//			bson_append_start_object(queryDocument, "0");
-//			bson_append_string(queryDocument, "$unwind", "$likes");
+//bson *
+//CommandQueryDocument(Oid relationId, List *opExpressionList, MongoFdwOptions* mongoFdwOptions,
+//		      struct HTAB *columnMappingHash)
+//{
+//	List *equalityOperatorList = NIL;
+//	List *comparisonOperatorList = NIL;
+//	List *columnList = NIL;
+//	ListCell *equalityOperatorCell = NULL;
+//	ListCell *columnCell = NULL;
+//	bson *queryDocument = NULL;
+//	int documentStatus = BSON_OK;
+//	char *prefix = "parent.";
+//	char *oidGeneratedKeySuffix = ".generated";
+//	int prefix_len = strlen(prefix);
+//	StringInfo columnNameInfo = NULL;
+//
+//	ereport(INFO, (errmsg_internal("Entered CommandQueryDocument")));
+//	ereport(INFO, (errmsg("collection= %s  unwindField= %s", mongoFdwOptions->collectionName,
+//			mongoFdwOptions->unwindFieldName)));
+//	char **tokens;
+//	tokens = StrSplit(mongoFdwOptions->unwindFieldName, '.');
+//	ereport(INFO, (errmsg("%s", *tokens)));
+//	queryDocument = bson_create();
+//	bson_init(queryDocument);
+//	//bson_append_string(queryDocument, "aggregate", "users");
+//	bson_append_string(queryDocument, "aggregate", mongoFdwOptions->collectionName);
+//	bson_append_start_array(queryDocument, "pipeline");
+//	if (tokens) {
+//		int i;
+//		char fieldPath[512];
+//		strcpy(fieldPath, "$");
+//		// we need to construct a string like "$field1" and "$field1.field2" etc.
+//		ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
+//		for (i=0; *(tokens+i); i++) {
+//			if (i > 0) {
+//				strcat(fieldPath, ".");
+//			}
+//			ereport(INFO, (errmsg("%d fieldPath= %s", i, fieldPath)));
+//			strcat(fieldPath, *(tokens+i));
+//			ereport(INFO, (errmsg("fieldPath= %s", fieldPath)));
+//			char str[10];
+//			sprintf(str, "%d", i);
+//
+//			bson_append_start_object(queryDocument, str);
+//			bson_append_string(queryDocument, "$unwind", fieldPath);
 //		    bson_append_finish_object(queryDocument);
-		}
-		free(tokens);
-//		bson_append_start_object(queryDocument, "1");
-//		bson_append_string(queryDocument, "$unwind", "$likes.plays");
-//	    bson_append_finish_object(queryDocument);
-	}
-	bson_append_finish_array(queryDocument);
-	bson_finish(queryDocument);
-	ereport(INFO, (errmsg("queryDocument----------------->")));
-	my_bson_print(queryDocument);
-	return queryDocument;
-
-
-	/*
-	 * We distinguish between equality expressions and others since we need to
-	 * insert the latter (<, >, <=, >=, <>) as separate sub-documents into the
-	 * BSON query object.
-	 */
-	equalityOperatorList = EqualityOperatorList(opExpressionList);
-	comparisonOperatorList = list_difference(opExpressionList, equalityOperatorList);
-
-	/* append equality expressions to the query */
-	foreach(equalityOperatorCell, equalityOperatorList)
-	{
-		OpExpr *equalityOperator = (OpExpr *) lfirst(equalityOperatorCell);
-		Oid columnId = InvalidOid;
-		char *columnName = NULL;
-		int suffixLen = strlen(oidGeneratedKeySuffix);
-		int columnNameLen = 0;
-		char *dot = NULL;
-		bson_type toBsonType = -1;
-		bool handleFound = false;
-		ColumnMapping *columnMapping = NULL;
-		void *hashKey;
-
-		List *argumentList = equalityOperator->args;
-		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
-		Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
-
-		columnId = column->varattno;
-		columnName = get_relid_attribute_name(relationId, columnId);
-		hashKey = (void *) columnName;
-		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
-													  hashKey, HASH_FIND,
-													  &handleFound);
-		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
-			if (strncmp(columnName, prefix, prefix_len) == 0)
-			{
-				columnName = columnName + prefix_len;
-			}
-			else
-			{
-				columnNameInfo = makeStringInfo();
-				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
-								 columnName);
-				columnName = columnNameInfo->data;
-			}
-		}
-
-		columnNameLen = strlen(columnName);
-		if (columnNameLen > suffixLen &&
-			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
-		{
-			dot = columnName + (columnNameLen - suffixLen);
-			/* Chop .generated off of the keyname to get the oid name */
-			*dot = '\0';
-			toBsonType = BSON_OID;
-		}
-		else if(columnMapping)
-		{
-			toBsonType = columnMapping->columnBsonType;
-		}
-
-		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
-		//my_bson_print(queryDocument, 0);
-
-		if (dot) {
-			*dot = '.';
-		}
-	}
-
-	/*
-	 * For comparison expressions, we need to group them by their columns and
-	 * append all expressions that correspond to a column as one sub-document.
-	 * Otherwise, even when we have two expressions to define the upper- and
-	 * lower-bound of a range, Mongo uses only one of these expressions during
-	 * an index search.
-	 */
-	columnList = UniqueColumnList(comparisonOperatorList);
-
-	/* append comparison expressions, grouped by columns, to the query */
-	foreach(columnCell, columnList)
-	{
-		Var *column = (Var *) lfirst(columnCell);
-		Oid columnId = InvalidOid;
-		char *columnName = NULL;
-		List *columnOperatorList = NIL;
-		ListCell *columnOperatorCell = NULL;
-		int suffixLen = strlen(oidGeneratedKeySuffix);
-		int columnNameLen = 0;
-		char *dot = NULL;
-		bson_type toBsonType = -1;
-		ColumnMapping *columnMapping = NULL;
-		bool handleFound = false;
-		void *hashKey;
-
-		columnId = column->varattno;
-		columnName = get_relid_attribute_name(relationId, columnId);
-		hashKey = (void *) columnName;
-		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
-													  hashKey, HASH_FIND,
-													  &handleFound);
-		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
-			if (strncmp(columnName, prefix, prefix_len) == 0)
-			{
-				columnName = columnName + prefix_len;
-			}
-			else
-			{
-				columnNameInfo = makeStringInfo();
-				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
-								 columnName);
-				columnName = columnNameInfo->data;
-			}
-		}
-
-		columnNameLen = strlen(columnName);
-		if (columnNameLen > suffixLen &&
-			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
-		{
-			dot = columnName + (columnNameLen - suffixLen);
-			/* Chop .generated off of the keyname to get the oid name */
-			*dot = '\0';
-			toBsonType = BSON_OID;
-		}
-		else if(columnMapping)
-		{
-			toBsonType = columnMapping->columnBsonType;
-		}
-
-		/* find all expressions that correspond to the column */
-		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
-
-		/* for comparison expressions, start a sub-document */
-		bson_append_start_object(queryDocument, columnName);
-		//my_bson_print(queryDocument, 0);
-
-		if (dot) {
-			*dot = '.';
-		}
-
-		foreach(columnOperatorCell, columnOperatorList)
-		{
-			OpExpr *columnOperator = (OpExpr *) lfirst(columnOperatorCell);
-			char *operatorName = NULL;
-			char *mongoOperatorName = NULL;
-
-			List *argumentList = columnOperator->args;
-			Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
-
-			operatorName = get_opname(columnOperator->opno);
-			mongoOperatorName = MongoOperatorName(operatorName);
-
-			AppendConstantValue(queryDocument, mongoOperatorName, toBsonType, constant);
-			//my_bson_print(queryDocument, 0);
-		}
-
-		bson_append_finish_object(queryDocument);
-		//my_bson_print(queryDocument, 0);
-	}
-
-	documentStatus = bson_finish(queryDocument);
-	ereport(INFO, (errmsg_internal("Leaving QueryDocument")));
-	my_bson_print(queryDocument);
-	if (documentStatus != BSON_OK)
-	{
-		ereport(ERROR, (errmsg("could not create document for query"),
-						errhint("BSON error: %s", queryDocument->errstr)));
-	}
-
-	return queryDocument;
-}
+//		    free(*(tokens+i));
+//
+////			bson_append_start_object(queryDocument, "0");
+////			bson_append_string(queryDocument, "$unwind", "$likes");
+////		    bson_append_finish_object(queryDocument);
+//		}
+//		free(tokens);
+////		bson_append_start_object(queryDocument, "1");
+////		bson_append_string(queryDocument, "$unwind", "$likes.plays");
+////	    bson_append_finish_object(queryDocument);
+//	}
+//	bson_append_finish_array(queryDocument);
+//	bson_finish(queryDocument);
+//	ereport(INFO, (errmsg("queryDocument----------------->")));
+//	my_bson_print(queryDocument);
+//	return queryDocument;
+//
+//
+//	/*
+//	 * We distinguish between equality expressions and others since we need to
+//	 * insert the latter (<, >, <=, >=, <>) as separate sub-documents into the
+//	 * BSON query object.
+//	 */
+//	equalityOperatorList = EqualityOperatorList(opExpressionList);
+//	comparisonOperatorList = list_difference(opExpressionList, equalityOperatorList);
+//
+//	/* append equality expressions to the query */
+//	foreach(equalityOperatorCell, equalityOperatorList)
+//	{
+//		OpExpr *equalityOperator = (OpExpr *) lfirst(equalityOperatorCell);
+//		Oid columnId = InvalidOid;
+//		char *columnName = NULL;
+//		int suffixLen = strlen(oidGeneratedKeySuffix);
+//		int columnNameLen = 0;
+//		char *dot = NULL;
+//		bson_type toBsonType = -1;
+//		bool handleFound = false;
+//		ColumnMapping *columnMapping = NULL;
+//		void *hashKey;
+//
+//		List *argumentList = equalityOperator->args;
+//		Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
+//		Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
+//
+//		columnId = column->varattno;
+//		columnName = get_relid_attribute_name(relationId, columnId);
+//		hashKey = (void *) columnName;
+//		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+//													  hashKey, HASH_FIND,
+//													  &handleFound);
+//		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
+//			if (strncmp(columnName, prefix, prefix_len) == 0)
+//			{
+//				columnName = columnName + prefix_len;
+//			}
+//			else
+//			{
+//				columnNameInfo = makeStringInfo();
+//				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+//								 columnName);
+//				columnName = columnNameInfo->data;
+//			}
+//		}
+//
+//		columnNameLen = strlen(columnName);
+//		if (columnNameLen > suffixLen &&
+//			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+//		{
+//			dot = columnName + (columnNameLen - suffixLen);
+//			/* Chop .generated off of the keyname to get the oid name */
+//			*dot = '\0';
+//			toBsonType = BSON_OID;
+//		}
+//		else if(columnMapping)
+//		{
+//			toBsonType = columnMapping->columnBsonType;
+//		}
+//
+//		AppendConstantValue(queryDocument, columnName, toBsonType, constant);
+//		//my_bson_print(queryDocument, 0);
+//
+//		if (dot) {
+//			*dot = '.';
+//		}
+//	}
+//
+//	/*
+//	 * For comparison expressions, we need to group them by their columns and
+//	 * append all expressions that correspond to a column as one sub-document.
+//	 * Otherwise, even when we have two expressions to define the upper- and
+//	 * lower-bound of a range, Mongo uses only one of these expressions during
+//	 * an index search.
+//	 */
+//	columnList = UniqueColumnList(comparisonOperatorList);
+//
+//	/* append comparison expressions, grouped by columns, to the query */
+//	foreach(columnCell, columnList)
+//	{
+//		Var *column = (Var *) lfirst(columnCell);
+//		Oid columnId = InvalidOid;
+//		char *columnName = NULL;
+//		List *columnOperatorList = NIL;
+//		ListCell *columnOperatorCell = NULL;
+//		int suffixLen = strlen(oidGeneratedKeySuffix);
+//		int columnNameLen = 0;
+//		char *dot = NULL;
+//		bson_type toBsonType = -1;
+//		ColumnMapping *columnMapping = NULL;
+//		bool handleFound = false;
+//		void *hashKey;
+//
+//		columnId = column->varattno;
+//		columnName = get_relid_attribute_name(relationId, columnId);
+//		hashKey = (void *) columnName;
+//		columnMapping = (ColumnMapping *) hash_search(columnMappingHash,
+//													  hashKey, HASH_FIND,
+//													  &handleFound);
+//		if (mongoFdwOptions->fieldName && *mongoFdwOptions->fieldName != '\0') {
+//			if (strncmp(columnName, prefix, prefix_len) == 0)
+//			{
+//				columnName = columnName + prefix_len;
+//			}
+//			else
+//			{
+//				columnNameInfo = makeStringInfo();
+//				appendStringInfo(columnNameInfo, "%s.%s", mongoFdwOptions->fieldName,
+//								 columnName);
+//				columnName = columnNameInfo->data;
+//			}
+//		}
+//
+//		columnNameLen = strlen(columnName);
+//		if (columnNameLen > suffixLen &&
+//			strcmp(columnName + (columnNameLen - suffixLen), oidGeneratedKeySuffix) == 0)
+//		{
+//			dot = columnName + (columnNameLen - suffixLen);
+//			/* Chop .generated off of the keyname to get the oid name */
+//			*dot = '\0';
+//			toBsonType = BSON_OID;
+//		}
+//		else if(columnMapping)
+//		{
+//			toBsonType = columnMapping->columnBsonType;
+//		}
+//
+//		/* find all expressions that correspond to the column */
+//		columnOperatorList = ColumnOperatorList(column, comparisonOperatorList);
+//
+//		/* for comparison expressions, start a sub-document */
+//		bson_append_start_object(queryDocument, columnName);
+//		//my_bson_print(queryDocument, 0);
+//
+//		if (dot) {
+//			*dot = '.';
+//		}
+//
+//		foreach(columnOperatorCell, columnOperatorList)
+//		{
+//			OpExpr *columnOperator = (OpExpr *) lfirst(columnOperatorCell);
+//			char *operatorName = NULL;
+//			char *mongoOperatorName = NULL;
+//
+//			List *argumentList = columnOperator->args;
+//			Const *constant = (Const *) FindArgumentOfType(argumentList, T_Const);
+//
+//			operatorName = get_opname(columnOperator->opno);
+//			mongoOperatorName = MongoOperatorName(operatorName);
+//
+//			AppendConstantValue(queryDocument, mongoOperatorName, toBsonType, constant);
+//			//my_bson_print(queryDocument, 0);
+//		}
+//
+//		bson_append_finish_object(queryDocument);
+//		//my_bson_print(queryDocument, 0);
+//	}
+//
+//	documentStatus = bson_finish(queryDocument);
+//	ereport(INFO, (errmsg_internal("Leaving QueryDocument")));
+//	my_bson_print(queryDocument);
+//	if (documentStatus != BSON_OK)
+//	{
+//		ereport(ERROR, (errmsg("could not create document for query"),
+//						errhint("BSON error: %s", queryDocument->errstr)));
+//	}
+//
+//	return queryDocument;
+//}
 /*
  * MongoOperatorName takes in the given PostgreSQL comparison operator name, and
  * returns its equivalent in MongoDB.
